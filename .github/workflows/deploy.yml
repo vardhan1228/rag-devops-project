@@ -4,7 +4,7 @@ name: deploy
 # Lambda cannot start until an image exists inside it. So the apply is split:
 #
 #   1. test / validate        - fail fast before touching AWS
-#   2. bootstrap              - verify credentials, ensure the state bucket
+#   2. bootstrap              - verify credentials, create the state bucket
 #   3. plan (PRs only)        - review-only, no changes applied
 #   4. apply-registry         - create just the ECR repository
 #   5. build                  - build and push the image, tagged with the SHA
@@ -16,11 +16,14 @@ name: deploy
 #
 # Credentials: long-lived IAM user access keys held as repository secrets.
 #   Secrets   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-#   Variables TF_STATE_BUCKET, AWS_ACCOUNT_ID
+#   Variables AWS_ACCOUNT_ID (optional), TF_STATE_BUCKET (optional override)
 #
 # AWS_ACCOUNT_ID is not a secret; it is asserted against the caller identity so
 # a swapped key cannot quietly deploy into a different account. Because these
 # keys never expire on their own, rotate them on a schedule.
+#
+# Every job that runs `terraform init` creates the state bucket first, so the
+# backend always exists even when a single job is re-run on its own.
 
 on:
   push:
@@ -43,8 +46,9 @@ env:
   TF_VERSION: 1.15.5
   PYTHON_VERSION: "3.12"
   TF_IN_AUTOMATION: "true"
-  # Repository variables (Settings > Variables), not secrets.
-  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  # Terraform state bucket. Set the TF_STATE_BUCKET repository variable to
+  # override it per fork or account.
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'dev-genai-cloudrag' }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   TF_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
 
@@ -104,29 +108,17 @@ jobs:
     needs: [test, validate]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
       # Secrets are passed through env, never interpolated into the shell, so a
       # value containing shell metacharacters cannot be executed.
-      - name: Check required configuration is present
+      - name: Check the credentials are configured
         env:
           KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          missing=0
-          if [ -z "${TF_STATE_BUCKET}" ]; then
-            echo "::error::Set the TF_STATE_BUCKET repository variable."
-            missing=1
-          fi
           if [ -z "${KEY_ID}" ] || [ -z "${SECRET}" ]; then
             echo "::error::Set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets."
-            missing=1
+            exit 1
           fi
-          exit $missing
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -145,14 +137,51 @@ jobs:
             exit 1
           fi
 
-      # Idempotent, and repeated immediately before every terraform init by the
-      # tf-init composite action. Doing it here too means a misconfigured
-      # bucket name fails before any image is built.
-      - name: Ensure the state bucket exists
-        uses: ./.github/actions/tf-init
-        with:
-          bucket: ${{ env.TF_STATE_BUCKET }}
-          region: ${{ env.AWS_REGION }}
+      # State holds secrets in plaintext, so versioning, encryption, a public
+      # access block and TLS-only access are requirements, not extras. Re-run
+      # safe: settings are reapplied even when the bucket already exists.
+      - name: Create the Terraform state bucket
+        run: |
+          set -euo pipefail
+
+          if aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            echo "Bucket $TF_STATE_BUCKET already exists."
+          else
+            echo "Creating $TF_STATE_BUCKET in $AWS_REGION"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+            else
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
+          fi
+
+          aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-bucket-encryption --bucket "$TF_STATE_BUCKET" \
+            --server-side-encryption-configuration \
+            '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+
+          aws s3api put-public-access-block --bucket "$TF_STATE_BUCKET" \
+            --public-access-block-configuration \
+            'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+          aws s3api put-bucket-policy --bucket "$TF_STATE_BUCKET" --policy "{
+            \"Version\": \"2012-10-17\",
+            \"Statement\": [{
+              \"Sid\": \"DenyInsecureTransport\",
+              \"Effect\": \"Deny\",
+              \"Principal\": \"*\",
+              \"Action\": \"s3:*\",
+              \"Resource\": [
+                \"arn:aws:s3:::$TF_STATE_BUCKET\",
+                \"arn:aws:s3:::$TF_STATE_BUCKET/*\"
+              ],
+              \"Condition\": { \"Bool\": { \"aws:SecureTransport\": \"false\" } }
+            }]
+          }"
 
   # ------------------------------------------------------ pull requests only
   plan:
@@ -173,11 +202,26 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Ensure the state bucket exists
+        run: |
+          set -euo pipefail
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+            else
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
+            aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+              --versioning-configuration Status=Enabled
+          fi
+
       - name: Init
-        uses: ./.github/actions/tf-init
-        with:
-          bucket: ${{ env.TF_STATE_BUCKET }}
-          region: ${{ env.AWS_REGION }}
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
 
       # Plans against whatever image is currently deployed, so an unpushed tag
       # cannot make the diff look artificially large.
@@ -218,11 +262,26 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Ensure the state bucket exists
+        run: |
+          set -euo pipefail
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+            else
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
+            aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+              --versioning-configuration Status=Enabled
+          fi
+
       - name: Init
-        uses: ./.github/actions/tf-init
-        with:
-          bucket: ${{ env.TF_STATE_BUCKET }}
-          region: ${{ env.AWS_REGION }}
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
 
       # -target builds only the dependency closure, which is exactly what is
       # wanted here. The full apply in a later stage fills in everything else.
@@ -292,11 +351,26 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Ensure the state bucket exists
+        run: |
+          set -euo pipefail
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+            else
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
+            aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+              --versioning-configuration Status=Enabled
+          fi
+
       - name: Init
-        uses: ./.github/actions/tf-init
-        with:
-          bucket: ${{ env.TF_STATE_BUCKET }}
-          region: ${{ env.AWS_REGION }}
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
 
       - name: Plan
         run: |
