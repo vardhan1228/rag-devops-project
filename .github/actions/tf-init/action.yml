@@ -1,0 +1,109 @@
+name: Terraform init with remote state
+description: >
+  Creates the S3 state bucket if it does not exist, then runs terraform init
+  against it. Keeping both steps together guarantees the backend store exists
+  immediately before init, even when a single job is re-run on its own.
+
+inputs:
+  bucket:
+    description: Name of the S3 bucket holding Terraform state.
+    required: true
+  region:
+    description: AWS region for the bucket and the backend.
+    required: true
+  chdir:
+    description: Directory containing the Terraform configuration.
+    required: false
+    default: terraform
+
+runs:
+  using: composite
+  steps:
+    # head-bucket distinguishes three cases that must not be conflated:
+    #   404 - does not exist, so create it
+    #   403 - exists but belongs to another account, so fail loudly
+    #   other - an unexpected error; do not paper over it with a create
+    - name: Ensure the state bucket exists
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        REGION: ${{ inputs.region }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${BUCKET}" ]; then
+          echo "::error::No state bucket name was supplied."
+          exit 1
+        fi
+
+        if probe=$(aws s3api head-bucket --bucket "${BUCKET}" 2>&1); then
+          echo "State bucket ${BUCKET} already exists."
+        else
+          if printf '%s' "${probe}" | grep -q '404'; then
+            echo "Creating state bucket ${BUCKET} in ${REGION}"
+            # Tolerate a concurrent creation from a parallel job.
+            if [ "${REGION}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "${BUCKET}" \
+                || aws s3api head-bucket --bucket "${BUCKET}"
+            else
+              aws s3api create-bucket --bucket "${BUCKET}" \
+                --create-bucket-configuration "LocationConstraint=${REGION}" \
+                || aws s3api head-bucket --bucket "${BUCKET}"
+            fi
+            aws s3api wait bucket-exists --bucket "${BUCKET}"
+          elif printf '%s' "${probe}" | grep -q '403'; then
+            echo "::error::Bucket ${BUCKET} exists but this account cannot access it. S3 names are global - choose another."
+            exit 1
+          else
+            echo "::error::Could not check bucket ${BUCKET}: ${probe}"
+            exit 1
+          fi
+        fi
+
+    # Applied every run, so an existing bucket is brought up to standard too.
+    # State holds secrets in plaintext, so versioning, encryption and a public
+    # access block are all mandatory rather than nice to have.
+    - name: Harden the state bucket
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+      run: |
+        set -euo pipefail
+
+        aws s3api put-bucket-versioning --bucket "${BUCKET}" \
+          --versioning-configuration Status=Enabled
+
+        aws s3api put-bucket-encryption --bucket "${BUCKET}" \
+          --server-side-encryption-configuration \
+          '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+
+        aws s3api put-public-access-block --bucket "${BUCKET}" \
+          --public-access-block-configuration \
+          'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+        aws s3api put-bucket-policy --bucket "${BUCKET}" --policy "$(cat <<JSON
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "DenyInsecureTransport",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": ["arn:aws:s3:::${BUCKET}", "arn:aws:s3:::${BUCKET}/*"],
+            "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+          }]
+        }
+        JSON
+        )"
+
+    - name: Terraform init
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        REGION: ${{ inputs.region }}
+        CHDIR: ${{ inputs.chdir }}
+      run: |
+        set -euo pipefail
+        terraform -chdir="${CHDIR}" init -input=false \
+          -backend-config="bucket=${BUCKET}" \
+          -backend-config="region=${REGION}"

@@ -104,6 +104,12 @@ jobs:
     needs: [test, validate]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
       # Secrets are passed through env, never interpolated into the shell, so a
       # value containing shell metacharacters cannot be executed.
       - name: Check required configuration is present
@@ -139,31 +145,14 @@ jobs:
             exit 1
           fi
 
-      # Idempotent: creates the bucket on first run, no-ops afterwards.
-      - name: Ensure the bucket exists, versioned and encrypted
-        run: |
-          if aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
-            echo "Bucket already present."
-          else
-            echo "Creating $TF_STATE_BUCKET"
-            if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
-            else
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
-                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
-            fi
-          fi
-
-          aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
-            --versioning-configuration Status=Enabled
-
-          aws s3api put-bucket-encryption --bucket "$TF_STATE_BUCKET" \
-            --server-side-encryption-configuration \
-            '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
-
-          aws s3api put-public-access-block --bucket "$TF_STATE_BUCKET" \
-            --public-access-block-configuration \
-            'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+      # Idempotent, and repeated immediately before every terraform init by the
+      # tf-init composite action. Doing it here too means a misconfigured
+      # bucket name fails before any image is built.
+      - name: Ensure the state bucket exists
+        uses: ./.github/actions/tf-init
+        with:
+          bucket: ${{ env.TF_STATE_BUCKET }}
+          region: ${{ env.AWS_REGION }}
 
   # ------------------------------------------------------ pull requests only
   plan:
@@ -185,10 +174,10 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Init
-        run: |
-          terraform -chdir=terraform init -input=false \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
-            -backend-config="region=$AWS_REGION"
+        uses: ./.github/actions/tf-init
+        with:
+          bucket: ${{ env.TF_STATE_BUCKET }}
+          region: ${{ env.AWS_REGION }}
 
       # Plans against whatever image is currently deployed, so an unpushed tag
       # cannot make the diff look artificially large.
@@ -230,10 +219,10 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Init
-        run: |
-          terraform -chdir=terraform init -input=false \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
-            -backend-config="region=$AWS_REGION"
+        uses: ./.github/actions/tf-init
+        with:
+          bucket: ${{ env.TF_STATE_BUCKET }}
+          region: ${{ env.AWS_REGION }}
 
       # -target builds only the dependency closure, which is exactly what is
       # wanted here. The full apply in a later stage fills in everything else.
@@ -304,10 +293,10 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
 
       - name: Init
-        run: |
-          terraform -chdir=terraform init -input=false \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
-            -backend-config="region=$AWS_REGION"
+        uses: ./.github/actions/tf-init
+        with:
+          bucket: ${{ env.TF_STATE_BUCKET }}
+          region: ${{ env.AWS_REGION }}
 
       - name: Plan
         run: |
