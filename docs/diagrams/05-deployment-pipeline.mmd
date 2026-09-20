@@ -1,0 +1,64 @@
+%% CI/CD pipeline. The apply is split because Terraform owns the registry,
+%% but ECS and Lambda cannot start until an image exists inside it.
+flowchart TB
+  dev["git push to main"]
+  prq["Pull request<br/>plan only, never applies"]
+
+  subgraph gha["GitHub Actions · deploy workflow"]
+    direction TB
+
+    subgraph q["Stage 1 · no AWS access, fails fast"]
+      direction LR
+      test["test<br/>ruff + pytest<br/>Python 3.12"]
+      val["validate<br/>terraform fmt -check<br/>terraform validate<br/>with -backend=false"]
+    end
+
+    boot["Stage 2 · bootstrap<br/>sts get-caller-identity<br/>assert it matches AWS_ACCOUNT_ID<br/>create state bucket if absent<br/>versioning · SSE · TLS-only policy"]
+
+    reg["Stage 3 · apply-registry<br/>terraform apply<br/>-target aws_ecr_repository.api<br/>nothing else yet"]
+
+    build["Stage 4 · build<br/>docker buildx build and push<br/>tag is the commit SHA<br/>provenance false, Lambda needs it"]
+
+    app["Stage 5 · apply<br/>terraform apply, full<br/>-var image_tag=SHA<br/>-var builder_enabled=false<br/>then wait services-stable"]
+
+    data["Stage 6 · corpus<br/>aws s3 sync --delete<br/>invoke Lambda reindex<br/>fail if 0 indexed or any failed"]
+
+    smoke["Stage 7 · smoke<br/>/health returns 200<br/>UI contains RAG Console<br/>/ready shows index_exists<br/>real question returns citations"]
+
+    test --> boot
+    val --> boot
+    boot --> reg --> build --> app --> data --> smoke
+  end
+
+  subgraph awsres["AWS"]
+    direction LR
+    tfstate[("S3 dev-genai-cloudrag<br/>terraform.tfstate<br/>S3 native locking")]
+    ecr[("ECR<br/>immutable tag = SHA")]
+    stack["VPC · ALB · ECS · Lambda<br/>OpenSearch · S3 · IAM<br/>Secrets · SQS · autoscaling"]
+    corpus[("S3 uploads/<br/>10 documents")]
+  end
+
+  dev --> test
+  dev --> val
+  prq -.-> boot
+
+  boot -.->|"create if absent"| tfstate
+  app -.->|"read and write state"| tfstate
+  build -.->|"push image"| ecr
+  app -.->|"create or update"| stack
+  data -.-> corpus
+  smoke -.->|"HTTP through the ALB"| stack
+
+  gate["Why the split<br/><br/>Terraform creates the ECR repository, but the ECS<br/>service and the Lambda both reference an image tag<br/>inside it. A single apply would fail on first run,<br/>because the tag does not exist yet."]
+
+  classDef job fill:#e8f0fe,stroke:#4c8dff,color:#11203a
+  classDef gateclass fill:#eaf7ee,stroke:#48a868,color:#11301c
+  classDef store fill:#fff4e5,stroke:#e8a33d,color:#3a2a11
+  classDef trigger fill:#f3e8ff,stroke:#9a4cff,color:#26113a
+  classDef note fill:#fffbe6,stroke:#d4b106,color:#3a3111
+
+  class test,val,reg,build,app,data job
+  class boot,smoke gateclass
+  class tfstate,ecr,stack,corpus store
+  class dev,prq trigger
+  class gate note

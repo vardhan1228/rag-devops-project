@@ -1,0 +1,72 @@
+%% Which service calls which, with what credential. Grouped by role to keep
+%% the read path and the write path visually separate.
+flowchart TB
+  user(["Browser"])
+
+  subgraph front["Entry"]
+    alb["Application Load Balancer<br/>public, HTTP :80"]
+  end
+
+  subgraph read["Read path · answering a question"]
+    direction TB
+    api["FastAPI on ECS Fargate<br/>task role: ecs_task"]
+  end
+
+  subgraph write["Write path · indexing documents"]
+    direction TB
+    lam["Lambda ingest<br/>task role: lambda_ingest"]
+  end
+
+  subgraph data["Data"]
+    direction TB
+    os[("OpenSearch · rag-chunks<br/>passage text + 1024-dim vector")]
+    s3[("S3 · uploads/<br/>source documents")]
+  end
+
+  subgraph models["Amazon Bedrock"]
+    direction TB
+    emb["Titan Embed v2<br/>amazon.titan-embed-text-v2:0"]
+    gen["Nova Lite<br/>amazon.nova-lite-v1:0"]
+  end
+
+  subgraph support["Supporting"]
+    direction TB
+    sm["Secrets Manager<br/>API key"]
+    dlq["SQS dead letter queue"]
+    ecr[("ECR<br/>one image, two entrypoints")]
+    logs["CloudWatch Logs"]
+  end
+
+  user -->|"POST /query"| alb
+  alb -->|"forward"| api
+
+  api -->|"1 · embed the question"| emb
+  api -->|"2 · kNN + BM25 search"| os
+  api -->|"3 · generate from context"| gen
+  api -->|"4 · answer + citations"| alb
+
+  s3 ==>|"ObjectCreated uploads/"| lam
+  lam -->|"read object"| s3
+  lam -->|"embed each passage"| emb
+  lam -->|"bulk index passages"| os
+  lam -.->|"after 1 failed retry"| dlq
+
+  ecr -.->|"uvicorn entrypoint"| api
+  ecr -.->|"awslambdaric entrypoint"| lam
+  sm -.->|"injected as API_KEY<br/>by execution role at startup"| api
+  api -.-> logs
+  lam -.-> logs
+
+  cred["Credentials<br/><br/>Browser to API: none required, require_auth = false<br/>API and Lambda to AWS: SigV4 signed with their task role<br/>No AWS keys exist anywhere in the image or the code"]
+
+  classDef edge fill:#f3e8ff,stroke:#9a4cff,color:#26113a
+  classDef compute fill:#e8f0fe,stroke:#4c8dff,color:#11203a
+  classDef store fill:#fff4e5,stroke:#e8a33d,color:#3a2a11
+  classDef model fill:#eaf7ee,stroke:#48a868,color:#11301c
+  classDef note fill:#fffbe6,stroke:#d4b106,color:#3a3111
+
+  class alb,user edge
+  class api,lam compute
+  class os,s3,ecr,sm,dlq,logs store
+  class emb,gen model
+  class cred note

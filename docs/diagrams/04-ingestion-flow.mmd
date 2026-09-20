@@ -1,0 +1,35 @@
+%% How documents in git become searchable passages.
+flowchart LR
+  git["sample-data/ in git<br/>10 banking documents<br/>about 7000 words"]
+
+  up[("S3 uploads/<br/>corpus objects")]
+
+  subgraph ing["Lambda ingest · one container, four stages"]
+    direction LR
+    load["1 · load<br/>txt, md, pdf<br/>skip unsupported types<br/>skip empty text"]
+    chunk["2 · chunk<br/>paragraphs, then sentences<br/>1000 char window<br/>150 char overlap<br/>id = docId::ordinal"]
+    embed["3 · embed<br/>Titan Embed v2<br/>1024 dims, normalized<br/>backoff on throttling"]
+    index["4 · index<br/>bulk upsert, refresh now<br/>per-passage errors counted,<br/>not fatal to the batch"]
+    load --> chunk --> embed --> index
+  end
+
+  os[("OpenSearch rag-chunks<br/>one document per passage")]
+  dlq["Dead letter queue"]
+
+  git -->|"CI: aws s3 sync --delete"| up
+  up -->|"path A · ObjectCreated<br/>one invocation per object"| load
+  up -->|"path B · CI invokes once<br/>reindex: drop then rebuild"| load
+  index --> os
+  index -.->|"after 1 retry"| dlq
+
+  whyb["Why path B exists<br/><br/>Deleting an object from S3 does not delete its<br/>passages from the index, so a replaced corpus<br/>would leave stale passages behind to be retrieved.<br/><br/>A single invocation also avoids the concurrent<br/>index-create race that per-object triggers caused."]
+
+  idem["Why re-running is safe<br/><br/>Passage ids are deterministic, so re-ingesting<br/>the same document overwrites the same index<br/>documents instead of creating duplicates."]
+
+  classDef step fill:#e8f0fe,stroke:#4c8dff,color:#11203a
+  classDef store fill:#fff4e5,stroke:#e8a33d,color:#3a2a11
+  classDef note fill:#fffbe6,stroke:#d4b106,color:#3a3111
+
+  class load,chunk,embed,index step
+  class up,os,dlq,git store
+  class whyb,idem note

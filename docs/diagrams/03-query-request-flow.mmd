@@ -1,0 +1,45 @@
+%% How a question becomes an answer.
+%% Notes span two participants so their text is not clipped.
+sequenceDiagram
+  autonumber
+  actor U as Browser
+  participant ALB as Load Balancer
+  participant API as FastAPI on Fargate
+  participant BR as Titan Embed v2
+  participant OS as OpenSearch
+  participant LLM as Nova Lite
+
+  U->>ALB: GET /
+  ALB->>API: forward to task :8000
+  API-->>U: index.html, no credentials in the page
+
+  U->>ALB: POST /query {question, k, mode}
+  ALB->>API: forward
+
+  Note over API,OS: No x-api-key needed: require_auth is false.<br/>Every AWS call below is SigV4 signed by the task role.
+
+  API->>BR: embed question, 1024 dims, normalized
+  BR-->>API: query vector
+
+  par Two retrievers, same index
+    API->>OS: kNN on vector field, size k*2
+    OS-->>API: passages ranked by cosine similarity
+  and
+    API->>OS: BM25 match on text field, size k*2
+    OS-->>API: passages ranked by keyword score
+  end
+
+  Note over API,OS: Cosine and BM25 scores are not comparable,<br/>so fusion uses rank only: sum of 1/(60 + rank).<br/>Passages both retrievers rank highly win.
+
+  API->>API: reciprocal rank fusion, keep top k
+  API->>API: number the passages, cap context at 12000 chars
+
+  alt Nothing retrieved
+    API-->>U: "could not find anything relevant"
+    Note over API,LLM: The model is never called with empty context,<br/>which would invite an ungrounded answer.
+  else Passages found
+    API->>LLM: Converse API, system prompt + context + question, temperature 0
+    LLM-->>API: answer citing [1] [2]
+    API-->>ALB: {answer, citations[], model_id}
+    ALB-->>U: JSON, rendered with its sources
+  end

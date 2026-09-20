@@ -1,0 +1,56 @@
+%% Where things physically sit, and how traffic is allowed to move.
+%% Edges connect concrete nodes only, to keep the routing legible.
+flowchart LR
+  net(["Internet"])
+  igw["Internet Gateway"]
+
+  subgraph vpc["VPC 10.50.0.0/16 · us-east-1"]
+    direction TB
+
+    subgraph pub["Public subnets · route 0.0.0.0/0 to IGW"]
+      direction TB
+      alb["Application Load Balancer<br/>10.50.0.0/24 az-a<br/>10.50.1.0/24 az-b<br/>listener HTTP :80"]
+      nat["NAT Gateway<br/>az-a only, single for cost"]
+    end
+
+    subgraph priv["Private subnets · route 0.0.0.0/0 to NAT · no inbound from internet"]
+      direction TB
+      ecs["Fargate tasks<br/>10.50.10.0/24 · 10.50.11.0/24<br/>assign_public_ip = false"]
+      lam["Lambda ENIs<br/>both private subnets"]
+      os[("OpenSearch data node<br/>VPC-only endpoint")]
+    end
+  end
+
+  s3ep["S3 Gateway Endpoint<br/>attached to private route table<br/>no NAT charge, no hourly cost"]
+  s3[("S3 documents bucket")]
+  aws(["Other AWS APIs<br/>Bedrock · ECR · Secrets · Logs"])
+
+  net -->|"inbound, only port 80"| igw
+  igw --> alb
+  alb -->|"to task port 8000"| ecs
+
+  ecs -->|"HTTPS 443"| os
+  lam -->|"HTTPS 443"| os
+
+  ecs -->|"egress"| nat
+  lam -->|"egress"| nat
+  nat --> igw
+  igw -.->|"outbound only"| aws
+
+  ecs -.-> s3ep
+  lam -.-> s3ep
+  s3ep --> s3
+
+  sg["Security group rules, all reference groups not CIDRs<br/><br/>alb-sg    inbound  80 from allowed_web_cidrs<br/>alb-sg    outbound 8000 to api-sg only<br/>api-sg    inbound  8000 from alb-sg and VPC CIDR<br/>search-sg inbound  443 from api-sg and lambda-sg<br/>builder-sg inbound none, managed over SSM"]
+
+  classDef edge fill:#f3e8ff,stroke:#9a4cff,color:#26113a
+  classDef compute fill:#e8f0fe,stroke:#4c8dff,color:#11203a
+  classDef store fill:#fff4e5,stroke:#e8a33d,color:#3a2a11
+  classDef ext fill:#eceff4,stroke:#8b96a8,color:#1b2027
+  classDef note fill:#fffbe6,stroke:#d4b106,color:#3a3111
+
+  class alb,nat,igw edge
+  class ecs,lam compute
+  class os,s3,s3ep store
+  class net,aws ext
+  class sg note
