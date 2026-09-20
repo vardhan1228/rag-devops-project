@@ -1,0 +1,57 @@
+# ------------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ------------------------------------------------------------------ testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------- terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# tfvars and backend configs often carry account ids, ARNs, and secrets
+*.tfvars
+*.tfvars.json
+backend.hcl
+
+# ----------------------------------------------------------------- secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+aws.json
+
+# --------------------------------------------------------------------- misc
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+data/
+tmp/

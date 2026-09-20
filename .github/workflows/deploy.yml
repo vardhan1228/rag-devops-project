@@ -1,0 +1,376 @@
+name: deploy
+
+# Deployment order matters here. Terraform owns the ECR repository, but ECS and
+# Lambda cannot start until an image exists inside it. So the apply is split:
+#
+#   1. test / validate        - fail fast before touching AWS
+#   2. bootstrap              - ensure the remote state bucket exists
+#   3. plan (PRs only)        - review-only, no changes applied
+#   4. apply-registry         - create just the ECR repository
+#   5. build                  - build and push the image, tagged with the SHA
+#   6. apply                  - full apply, wiring workloads to that image
+#   7. smoke                  - prove the deployed stack actually answers
+#
+# The build host EC2 instance is disabled in CI (builder_enabled=false) because
+# GitHub runners already have Docker.
+#
+# Credentials: static IAM access keys from repository secrets. Required:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# Optional:
+#   AWS_SESSION_TOKEN   - only for temporary credentials (sandbox/STS accounts).
+#                         Leave unset for a long-lived IAM user.
+# Rotate these on a schedule; unlike OIDC they do not expire on their own.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.15.5
+  PYTHON_VERSION: "3.12"
+  TF_IN_AUTOMATION: "true"
+  # Repository variable (Settings > Variables), not a secret.
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+
+# Never let two deployments race for the same state lock.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- quality
+  test:
+    name: lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ruff==0.8.4
+
+      - name: Lint
+        run: ruff check app tests
+
+      - name: Unit tests
+        run: pytest -q
+        env:
+          PYTHONPATH: .
+
+  validate:
+    name: terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Format check
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      # No backend or credentials needed just to check syntax and types.
+      - name: Validate
+        run: |
+          terraform -chdir=terraform init -backend=false
+          terraform -chdir=terraform validate
+
+  # --------------------------------------------------------------- bootstrap
+  bootstrap:
+    name: remote state bucket
+    needs: [test, validate]
+    runs-on: ubuntu-latest
+    steps:
+      # Secrets are passed through env, never interpolated into the shell, so a
+      # value containing shell metacharacters cannot be executed.
+      - name: Check required configuration is present
+        env:
+          KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          missing=0
+          if [ -z "${TF_STATE_BUCKET}" ]; then
+            echo "::error::Set the TF_STATE_BUCKET repository variable."
+            missing=1
+          fi
+          if [ -z "${KEY_ID}" ] || [ -z "${SECRET}" ]; then
+            echo "::error::Set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets."
+            missing=1
+          fi
+          exit $missing
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm the credentials work
+        run: aws sts get-caller-identity
+
+      # Idempotent: creates the bucket on first run, no-ops afterwards.
+      - name: Ensure the bucket exists, versioned and encrypted
+        run: |
+          if aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            echo "Bucket already present."
+          else
+            echo "Creating $TF_STATE_BUCKET"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+            else
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+          fi
+
+          aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-bucket-encryption --bucket "$TF_STATE_BUCKET" \
+            --server-side-encryption-configuration \
+            '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
+
+          aws s3api put-public-access-block --bucket "$TF_STATE_BUCKET" \
+            --public-access-block-configuration \
+            'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+  # ------------------------------------------------------ pull requests only
+  plan:
+    name: plan (review only)
+    needs: bootstrap
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Init
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
+
+      # Plans against whatever image is currently deployed, so an unpushed tag
+      # cannot make the diff look artificially large.
+      - name: Plan
+        run: |
+          terraform -chdir=terraform plan -input=false -lock-timeout=5m -no-color \
+            -var="environment=$TF_ENVIRONMENT" \
+            -var="builder_enabled=false" \
+            | tee plan.txt
+
+      - name: Summarize the plan
+        run: |
+          {
+            echo "### Terraform plan"
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt || tail -20 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------- stage 1: the registry
+  apply-registry:
+    name: create ECR repository
+    needs: bootstrap
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.ecr.outputs.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Init
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
+
+      # -target builds only the dependency closure, which is exactly what is
+      # wanted here. The full apply in a later stage fills in everything else.
+      - name: Apply the repository only
+        run: |
+          terraform -chdir=terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -var="environment=$TF_ENVIRONMENT" \
+            -var="builder_enabled=false" \
+            -target=aws_ecr_repository.api
+
+      - name: Export the repository URL
+        id: ecr
+        run: |
+          URL=$(terraform -chdir=terraform output -raw ecr_repository_url)
+          echo "repository=$URL" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------ stage 2: the image
+  build:
+    name: build & push image
+    needs: apply-registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The repository uses immutable tags, so the commit SHA is the tag.
+      # provenance=false keeps the manifest in the single-image format that
+      # Lambda requires.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ needs.apply-registry.outputs.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --------------------------------------------------- stage 3: the workloads
+  apply:
+    name: terraform apply
+    needs: build
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment in repo settings to gate prod.
+    environment: ${{ inputs.environment || 'dev' }}
+    outputs:
+      web_url: ${{ steps.outputs.outputs.web_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Init
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="region=$AWS_REGION"
+
+      - name: Plan
+        run: |
+          terraform -chdir=terraform plan -input=false -lock-timeout=5m \
+            -var="environment=$TF_ENVIRONMENT" \
+            -var="image_tag=${{ github.sha }}" \
+            -var="builder_enabled=false" \
+            -out=tfplan
+
+      # A first-run apply creates an OpenSearch domain, which takes 15-25 min.
+      - name: Apply
+        timeout-minutes: 45
+        run: terraform -chdir=terraform apply -input=false -auto-approve -lock-timeout=5m tfplan
+
+      - name: Wait for the service to stabilize
+        timeout-minutes: 20
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$(terraform -chdir=terraform output -raw ecs_cluster_name)" \
+            --services "$(terraform -chdir=terraform output -raw ecs_service_name)"
+
+      - name: Collect outputs
+        id: outputs
+        run: |
+          echo "web_url=$(terraform -chdir=terraform output -raw web_url)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deployed"
+            echo "- Web UI: $(terraform -chdir=terraform output -raw web_url)"
+            echo "- Image tag: \`${{ github.sha }}\`"
+            echo "- Chat model: $(terraform -chdir=terraform output -raw chat_model_id)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------- stage 4: verify it
+  smoke:
+    name: smoke test
+    needs: apply
+    runs-on: ubuntu-latest
+    steps:
+      # Reaches the ALB over the public internet. If you narrow
+      # allowed_web_cidrs, this job cannot connect - either allow the runner's
+      # egress range or drop this job.
+      - name: Probe the health endpoint through the load balancer
+        run: |
+          URL="${{ needs.apply.outputs.web_url }}"
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$URL/health" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Healthy after ${attempt} attempt(s)."
+              exit 0
+            fi
+            echo "attempt ${attempt}: HTTP ${code}"
+            sleep 10
+          done
+          echo "::error::Load balancer never returned 200 from /health"
+          exit 1
+
+      - name: Confirm the web UI is being served
+        run: |
+          curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'RAG Console'
+          echo "UI served."
+
+      - name: Confirm unauthenticated queries are rejected
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 \
+            -X POST -H 'content-type: application/json' \
+            -d '{"question":"probe"}' "${{ needs.apply.outputs.web_url }}/query")
+          if [ "$code" != "401" ]; then
+            echo "::error::Expected 401 without an API key, got $code"
+            exit 1
+          fi
+          echo "Auth enforced."
