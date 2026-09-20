@@ -392,6 +392,18 @@ jobs:
             --cluster "$(terraform -chdir=terraform output -raw ecs_cluster_name)" \
             --services "$(terraform -chdir=terraform output -raw ecs_service_name)"
 
+      # Uploading under uploads/ fires the S3 notification, so the ingest Lambda
+      # indexes each file. --size-only keeps re-runs cheap; passage ids are
+      # deterministic so re-ingesting the same file overwrites rather than
+      # duplicating.
+      - name: Upload the sample corpus
+        run: |
+          set -euo pipefail
+          BUCKET=$(terraform -chdir=terraform output -raw documents_bucket)
+          aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
+          echo "Corpus objects now in the bucket:"
+          aws s3 ls "s3://${BUCKET}/uploads/"
+
       - name: Collect outputs
         id: outputs
         run: |
@@ -401,6 +413,7 @@ jobs:
             echo "- Web UI: $(terraform -chdir=terraform output -raw web_url)"
             echo "- Image tag: \`${{ github.sha }}\`"
             echo "- Chat model: $(terraform -chdir=terraform output -raw chat_model_id)"
+            echo "- Corpus files: $(find sample-data -type f | wc -l)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------- stage 4: verify it
@@ -432,13 +445,42 @@ jobs:
           curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'RAG Console'
           echo "UI served."
 
-      - name: Confirm unauthenticated queries are rejected
+      # Ingestion is asynchronous: the sync in the previous job only triggered
+      # Lambda invocations. Poll until the index exists before querying.
+      - name: Wait for the corpus to be indexed
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 \
-            -X POST -H 'content-type: application/json' \
-            -d '{"question":"probe"}' "${{ needs.apply.outputs.web_url }}/query")
-          if [ "$code" != "401" ]; then
-            echo "::error::Expected 401 without an API key, got $code"
-            exit 1
+          URL="${{ needs.apply.outputs.web_url }}"
+          for attempt in $(seq 1 30); do
+            if curl -s -m 15 "$URL/ready" | grep -q '"index_exists":true'; then
+              echo "Index ready after ${attempt} attempt(s)."
+              exit 0
+            fi
+            echo "attempt ${attempt}: index not ready yet"
+            sleep 10
+          done
+          echo "::error::Index was not populated. Check the ingest Lambda logs and its DLQ."
+          exit 1
+
+      # End-to-end proof: retrieval found passages and the model answered from
+      # them. Asserting on citations rather than wording keeps this stable
+      # across model versions.
+      - name: Ask a real question
+        run: |
+          set -euo pipefail
+          body=$(curl -s -m 90 -X POST \
+            -H 'content-type: application/json' \
+            -d '{"question":"How are documents chunked before embedding?","k":5}' \
+            "${{ needs.apply.outputs.web_url }}/query")
+
+          echo "$body" | jq .
+
+          answer=$(echo "$body" | jq -r '.answer // empty')
+          cites=$(echo "$body" | jq '.citations | length')
+
+          if [ -z "$answer" ]; then
+            echo "::error::No answer returned"; exit 1
           fi
-          echo "Auth enforced."
+          if [ "$cites" -lt 1 ]; then
+            echo "::error::Answer had no citations, so retrieval returned nothing"; exit 1
+          fi
+          echo "Answered with ${cites} citation(s)."

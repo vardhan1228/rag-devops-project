@@ -54,9 +54,24 @@ variable "allowed_web_cidrs" {
   description = <<-EOT
     CIDRs allowed to reach the public load balancer. The listener is plain HTTP,
     so narrow this to your own address unless you add a TLS certificate.
+    This is the only access control when require_auth is false.
   EOT
   type        = list(string)
   default     = ["0.0.0.0/0"]
+}
+
+variable "require_auth" {
+  description = <<-EOT
+    Require an x-api-key header on /query and /ingest.
+
+    Note this is unrelated to how the service reaches Bedrock, which is always
+    authenticated by the task role. This setting controls who may call the API.
+    With it false, anyone who can reach the load balancer can read the indexed
+    corpus and spend Bedrock tokens billed to this account, so pair false with a
+    narrow allowed_web_cidrs.
+  EOT
+  type        = bool
+  default     = false
 }
 
 # ------------------------------------------------------------------- search

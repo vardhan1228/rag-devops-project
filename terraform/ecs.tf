@@ -110,11 +110,12 @@ resource "aws_ecs_task_definition" "api" {
       { name = "EMBED_DIMENSION", value = tostring(var.embed_dimension) },
       { name = "CHAT_MODEL_ID", value = var.chat_model_id },
       { name = "AWS_REGION", value = var.aws_region },
-      { name = "REQUIRE_AUTH", value = "true" },
+      { name = "REQUIRE_AUTH", value = tostring(var.require_auth) },
       { name = "PORT", value = tostring(var.api_port) },
     ]
 
-    # Injected at start-up; never baked into the image or state.
+    # Injected at start-up; never baked into the image or state. Still provided
+    # when require_auth is false so the flag can be flipped without a rebuild.
     secrets = [
       { name = "API_KEY", valueFrom = aws_secretsmanager_secret.api_key.arn },
     ]

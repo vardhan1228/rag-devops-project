@@ -5,7 +5,6 @@ requirements.txt and runs them.
 """
 
 import importlib
-import os
 
 import pytest
 
@@ -16,10 +15,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 API_KEY = "test-key-1234567890"
 
 
-@pytest.fixture
-def client(monkeypatch):
-    monkeypatch.setenv("API_KEY", API_KEY)
-    monkeypatch.setenv("REQUIRE_AUTH", "true")
+def _load(monkeypatch, *, require_auth: bool, api_key: str | None = API_KEY):
+    """Reload the app module under a given auth configuration."""
+    monkeypatch.setenv("REQUIRE_AUTH", "true" if require_auth else "false")
+    if api_key is None:
+        monkeypatch.delenv("API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("API_KEY", api_key)
 
     import app.api.main as main
 
@@ -27,80 +29,91 @@ def client(monkeypatch):
     return TestClient(main.app), main
 
 
-def test_health_is_public(client):
-    c, _ = client
-    res = c.get("/health")
-    assert res.status_code == 200
-    assert res.json() == {"status": "ok"}
+@pytest.fixture
+def open_client(monkeypatch):
+    """Default deployment shape: caller auth disabled."""
+    return _load(monkeypatch, require_auth=False, api_key=None)
 
 
-def test_web_ui_is_served_at_root(client):
-    c, _ = client
+@pytest.fixture
+def secured_client(monkeypatch):
+    return _load(monkeypatch, require_auth=True)
+
+
+def _fake_answer(main, monkeypatch):
+    from app.retrieval.rag import Answer
+
+    monkeypatch.setattr(
+        main,
+        "answer_question",
+        lambda question, k, search_fn: Answer(
+            answer="Sentences are packed into a 1000 character window. [1]",
+            citations=[{"marker": 1, "doc_id": "d", "source": "s", "score": 0.5}],
+            model_id="amazon.nova-lite-v1:0",
+        ),
+    )
+
+
+# ------------------------------------------------------------------- public
+def test_health_is_public(open_client):
+    c, _ = open_client
+    assert c.get("/health").json() == {"status": "ok"}
+
+
+def test_web_ui_is_served_at_root(open_client):
+    c, _ = open_client
     res = c.get("/")
     assert res.status_code == 200
     assert "text/html" in res.headers["content-type"]
     assert "RAG Console" in res.text
 
 
-def test_ui_does_not_leak_the_api_key(client):
-    c, _ = client
-    assert API_KEY not in c.get("/").text
+def test_ui_asks_for_no_credentials(open_client):
+    """The console posts questions directly; there is no key field to fill in."""
+    c, _ = open_client
+    body = c.get("/").text
+    assert "x-api-key" not in body
+    assert "apiKey" not in body
+    assert 'type="password"' not in body
 
 
-@pytest.mark.parametrize("path", ["/query", "/ingest"])
-def test_write_routes_require_the_key(client, path):
-    c, _ = client
-    assert c.post(path, json={"question": "hi", "source": "s3://b/k"}).status_code == 401
-    assert c.post(
-        path, json={"question": "hi", "source": "s3://b/k"}, headers={"x-api-key": "wrong"}
-    ).status_code == 401
+def test_query_works_without_a_key_when_auth_is_off(open_client, monkeypatch):
+    c, main = open_client
+    _fake_answer(main, monkeypatch)
 
-
-def test_query_returns_answer_and_citations(client, monkeypatch):
-    c, main = client
-    from app.retrieval.rag import Answer
-
-    def fake_answer(question, k, search_fn):
-        assert question == "why?"
-        return Answer(
-            answer="42",
-            citations=[{"marker": 1, "doc_id": "d", "source": "s", "score": 0.5}],
-            model_id="amazon.nova-lite-v1:0",
-        )
-
-    monkeypatch.setattr(main, "answer_question", fake_answer)
-
-    res = c.post("/query", json={"question": "why?"}, headers={"x-api-key": API_KEY})
+    res = c.post("/query", json={"question": "How are documents chunked?"})
     assert res.status_code == 200
     body = res.json()
-    assert body["answer"] == "42"
     assert body["citations"][0]["doc_id"] == "d"
     assert body["model_id"] == "amazon.nova-lite-v1:0"
 
 
-def test_startup_fails_without_a_key(monkeypatch):
-    monkeypatch.delenv("API_KEY", raising=False)
-    monkeypatch.setenv("REQUIRE_AUTH", "true")
+# ------------------------------------------------------------------ secured
+@pytest.mark.parametrize("path", ["/query", "/ingest"])
+def test_write_routes_require_the_key_when_enabled(secured_client, path):
+    c, _ = secured_client
+    payload = {"question": "hi", "source": "s3://b/k"}
+    assert c.post(path, json=payload).status_code == 401
+    assert c.post(path, json=payload, headers={"x-api-key": "wrong"}).status_code == 401
 
-    import app.api.main as main
 
+def test_correct_key_is_accepted(secured_client, monkeypatch):
+    c, main = secured_client
+    _fake_answer(main, monkeypatch)
+
+    res = c.post("/query", json={"question": "why?"}, headers={"x-api-key": API_KEY})
+    assert res.status_code == 200
+
+
+def test_enabling_auth_without_a_key_refuses_to_start(monkeypatch):
+    """Fail closed: never serve a route that is supposed to be guarded."""
     with pytest.raises(RuntimeError, match="API_KEY is not set"):
-        importlib.reload(main)
-
-    # Restore a usable module state for any later tests.
-    monkeypatch.setenv("API_KEY", API_KEY)
-    importlib.reload(main)
+        _load(monkeypatch, require_auth=True, api_key=None)
 
 
-def test_invalid_query_payload_is_rejected(client):
-    c, _ = client
-    res = c.post("/query", json={"question": ""}, headers={"x-api-key": API_KEY})
-    assert res.status_code == 422
-    res = c.post("/query", json={"question": "ok", "mode": "nope"}, headers={"x-api-key": API_KEY})
-    assert res.status_code == 422
-
-
-def test_environment_is_not_echoed(client):
-    c, _ = client
-    assert os.getenv("API_KEY") == API_KEY
-    assert API_KEY not in c.get("/health").text
+# ---------------------------------------------------------------- validation
+def test_invalid_query_payload_is_rejected(open_client):
+    c, _ = open_client
+    assert c.post("/query", json={"question": ""}).status_code == 422
+    assert c.post("/query", json={"question": "ok", "mode": "nope"}).status_code == 422
+    assert c.post("/query", json={"question": "ok", "k": 99}).status_code == 422

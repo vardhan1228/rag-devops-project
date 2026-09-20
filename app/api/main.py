@@ -1,17 +1,24 @@
 """FastAPI surface for the RAG service.
 
 Endpoints
-    GET  /              web UI (static, unauthenticated - contains no secrets)
-    GET  /health        liveness probe (unauthenticated, for the ALB)
+    GET  /              web UI (static, no credentials in the assets)
+    GET  /health        liveness probe, for the load balancer
     GET  /ready         checks the OpenSearch index is reachable
     POST /ingest        load + chunk + embed + index a source
     POST /query         retrieval-augmented answer
 
-Auth: every route except / and /health requires the `x-api-key` header to match
-the API_KEY environment variable. If API_KEY is unset the service refuses to
-start, so the endpoint is never exposed to the network without a credential.
-The UI asks the operator for that key and keeps it in sessionStorage; it is
-never baked into the served assets.
+Two unrelated kinds of authentication are involved here, and conflating them is
+a common mistake:
+
+1. The service to AWS. Bedrock, S3 and OpenSearch calls are signed with the
+   task role's temporary credentials, handled by boto3. Nothing to configure.
+
+2. The caller to this service. Controlled by REQUIRE_AUTH. When true, /query
+   and /ingest need an `x-api-key` header matching API_KEY, and the service
+   refuses to start if API_KEY is missing so it cannot fail open. When false
+   every route is public, which means anyone who can reach the load balancer can
+   read the indexed corpus and spend Bedrock tokens on this account. Only run
+   that way behind a restricted network path.
 """
 
 from __future__ import annotations
