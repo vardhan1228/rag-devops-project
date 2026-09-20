@@ -4,7 +4,7 @@ name: deploy
 # Lambda cannot start until an image exists inside it. So the apply is split:
 #
 #   1. test / validate        - fail fast before touching AWS
-#   2. bootstrap              - ensure the remote state bucket exists
+#   2. bootstrap              - verify credentials, ensure the state bucket
 #   3. plan (PRs only)        - review-only, no changes applied
 #   4. apply-registry         - create just the ECR repository
 #   5. build                  - build and push the image, tagged with the SHA
@@ -14,12 +14,13 @@ name: deploy
 # The build host EC2 instance is disabled in CI (builder_enabled=false) because
 # GitHub runners already have Docker.
 #
-# Credentials: static IAM access keys from repository secrets. Required:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-# Optional:
-#   AWS_SESSION_TOKEN   - only for temporary credentials (sandbox/STS accounts).
-#                         Leave unset for a long-lived IAM user.
-# Rotate these on a schedule; unlike OIDC they do not expire on their own.
+# Credentials: long-lived IAM user access keys held as repository secrets.
+#   Secrets   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   Variables TF_STATE_BUCKET, AWS_ACCOUNT_ID
+#
+# AWS_ACCOUNT_ID is not a secret; it is asserted against the caller identity so
+# a swapped key cannot quietly deploy into a different account. Because these
+# keys never expire on their own, rotate them on a schedule.
 
 on:
   push:
@@ -42,8 +43,9 @@ env:
   TF_VERSION: 1.15.5
   PYTHON_VERSION: "3.12"
   TF_IN_AUTOMATION: "true"
-  # Repository variable (Settings > Variables), not a secret.
+  # Repository variables (Settings > Variables), not secrets.
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   TF_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
 
 # Never let two deployments race for the same state lock.
@@ -98,7 +100,7 @@ jobs:
 
   # --------------------------------------------------------------- bootstrap
   bootstrap:
-    name: remote state bucket
+    name: credentials & state bucket
     needs: [test, validate]
     runs-on: ubuntu-latest
     steps:
@@ -124,11 +126,18 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Confirm the credentials work
-        run: aws sts get-caller-identity
+      # Fails in seconds if the keys are wrong, rather than midway through a
+      # 20-minute apply. Also refuses to run against an unexpected account.
+      - name: Verify the caller identity
+        run: |
+          ACTUAL=$(aws sts get-caller-identity --query Account --output text)
+          echo "Authenticated to account ${ACTUAL} as $(aws sts get-caller-identity --query Arn --output text)"
+          if [ -n "${AWS_ACCOUNT_ID}" ] && [ "${ACTUAL}" != "${AWS_ACCOUNT_ID}" ]; then
+            echo "::error::Credentials resolve to ${ACTUAL} but AWS_ACCOUNT_ID is ${AWS_ACCOUNT_ID}. Refusing to deploy."
+            exit 1
+          fi
 
       # Idempotent: creates the bucket on first run, no-ops afterwards.
       - name: Ensure the bucket exists, versioned and encrypted
@@ -169,7 +178,6 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
@@ -215,7 +223,6 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
@@ -255,7 +262,6 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: aws-actions/amazon-ecr-login@v2
@@ -291,7 +297,6 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
