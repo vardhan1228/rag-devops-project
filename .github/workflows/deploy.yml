@@ -502,3 +502,7 @@ jobs:
           echo "web_url=$(terraform -chdir=terraform output -raw web_url)" >> "$GITHUB_OUTPUT"
           {
             echo "### Deployed"
+            echo "- Environment: \`${TF_ENVIRONMENT}\`"
+            echo "- Image: \`${{ github.sha }}\`"
+            echo "- Web URL: $(terraform -chdir=terraform output -raw web_url)"
+          } >> "$GITHUB_STEP_SUMMARY"
