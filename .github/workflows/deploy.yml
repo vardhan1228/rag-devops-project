@@ -46,9 +46,12 @@ env:
   TF_VERSION: 1.15.5
   PYTHON_VERSION: "3.12"
   TF_IN_AUTOMATION: "true"
-  # Terraform state bucket. Set the TF_STATE_BUCKET repository variable to
-  # override it per fork or account.
-  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'dev-genai-cloudrag' }}
+  # Base name for the Terraform state bucket. The AWS account id is appended at
+  # runtime. S3 bucket names are globally unique across every AWS account, so a
+  # bare name created under one account cannot be created or read from another:
+  # HeadBucket answers 403, not 404, which looks like a permissions fault.
+  # Appending the account id keeps the name unique and survives account changes.
+  TF_STATE_BUCKET_BASE: ${{ vars.TF_STATE_BUCKET || 'dev-genai-cloudrag' }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   TF_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
 
@@ -144,31 +147,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          if aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
-            echo "Bucket $TF_STATE_BUCKET already exists."
-          else
-            echo "Creating $TF_STATE_BUCKET in $AWS_REGION"
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
+          echo "State bucket: ${BUCKET}"
+
+          # 404, 403 and everything else mean different things and must not be
+          # collapsed. Treating 403 as "absent" leads to a create attempt and an
+          # opaque BucketAlreadyExists, hiding the real cause.
+          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
+            echo "Bucket already exists and is accessible."
+          elif printf '%s' "$probe" | grep -q '404'; then
+            echo "Creating ${BUCKET} in ${AWS_REGION}"
             if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+              aws s3api create-bucket --bucket "$BUCKET"
             else
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+              aws s3api create-bucket --bucket "$BUCKET" \
                 --create-bucket-configuration "LocationConstraint=$AWS_REGION"
             fi
-            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
+            aws s3api wait bucket-exists --bucket "$BUCKET"
+          elif printf '%s' "$probe" | grep -q '403'; then
+            echo "::error::Bucket ${BUCKET} exists but this account cannot access it. S3 names are global; set the TF_STATE_BUCKET variable to a different base name."
+            exit 1
+          else
+            echo "::error::Could not check bucket ${BUCKET}: ${probe}"
+            exit 1
           fi
 
-          aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+          aws s3api put-bucket-versioning --bucket "$BUCKET" \
             --versioning-configuration Status=Enabled
 
-          aws s3api put-bucket-encryption --bucket "$TF_STATE_BUCKET" \
+          aws s3api put-bucket-encryption --bucket "$BUCKET" \
             --server-side-encryption-configuration \
             '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
 
-          aws s3api put-public-access-block --bucket "$TF_STATE_BUCKET" \
+          aws s3api put-public-access-block --bucket "$BUCKET" \
             --public-access-block-configuration \
             'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
 
-          aws s3api put-bucket-policy --bucket "$TF_STATE_BUCKET" --policy "{
+          aws s3api put-bucket-policy --bucket "$BUCKET" --policy "{
             \"Version\": \"2012-10-17\",
             \"Statement\": [{
               \"Sid\": \"DenyInsecureTransport\",
@@ -176,8 +192,8 @@ jobs:
               \"Principal\": \"*\",
               \"Action\": \"s3:*\",
               \"Resource\": [
-                \"arn:aws:s3:::$TF_STATE_BUCKET\",
-                \"arn:aws:s3:::$TF_STATE_BUCKET/*\"
+                \"arn:aws:s3:::$BUCKET\",
+                \"arn:aws:s3:::$BUCKET/*\"
               ],
               \"Condition\": { \"Bool\": { \"aws:SecureTransport\": \"false\" } }
             }]
@@ -202,19 +218,32 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Ensure the state bucket exists
+      # Resolves the same account-scoped name the bootstrap job created, and
+      # exports it so the init step below uses it. Creating it here too keeps
+      # this job correct when it is re-run on its own.
+      - name: Resolve and ensure the state bucket
         run: |
           set -euo pipefail
-          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
+          echo "TF_STATE_BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+          echo "State bucket: ${BUCKET}"
+
+          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
+            echo "Bucket is present."
+          elif printf '%s' "$probe" | grep -q '404'; then
             if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+              aws s3api create-bucket --bucket "$BUCKET"
             else
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+              aws s3api create-bucket --bucket "$BUCKET" \
                 --create-bucket-configuration "LocationConstraint=$AWS_REGION"
             fi
-            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
-            aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+            aws s3api wait bucket-exists --bucket "$BUCKET"
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
               --versioning-configuration Status=Enabled
+          else
+            echo "::error::Cannot access state bucket ${BUCKET}: ${probe}"
+            exit 1
           fi
 
       - name: Init
@@ -262,19 +291,32 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Ensure the state bucket exists
+      # Resolves the same account-scoped name the bootstrap job created, and
+      # exports it so the init step below uses it. Creating it here too keeps
+      # this job correct when it is re-run on its own.
+      - name: Resolve and ensure the state bucket
         run: |
           set -euo pipefail
-          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
+          echo "TF_STATE_BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+          echo "State bucket: ${BUCKET}"
+
+          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
+            echo "Bucket is present."
+          elif printf '%s' "$probe" | grep -q '404'; then
             if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+              aws s3api create-bucket --bucket "$BUCKET"
             else
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+              aws s3api create-bucket --bucket "$BUCKET" \
                 --create-bucket-configuration "LocationConstraint=$AWS_REGION"
             fi
-            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
-            aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+            aws s3api wait bucket-exists --bucket "$BUCKET"
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
               --versioning-configuration Status=Enabled
+          else
+            echo "::error::Cannot access state bucket ${BUCKET}: ${probe}"
+            exit 1
           fi
 
       - name: Init
@@ -351,19 +393,32 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Ensure the state bucket exists
+      # Resolves the same account-scoped name the bootstrap job created, and
+      # exports it so the init step below uses it. Creating it here too keeps
+      # this job correct when it is re-run on its own.
+      - name: Resolve and ensure the state bucket
         run: |
           set -euo pipefail
-          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
+          echo "TF_STATE_BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+          echo "State bucket: ${BUCKET}"
+
+          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
+            echo "Bucket is present."
+          elif printf '%s' "$probe" | grep -q '404'; then
             if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET"
+              aws s3api create-bucket --bucket "$BUCKET"
             else
-              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" \
+              aws s3api create-bucket --bucket "$BUCKET" \
                 --create-bucket-configuration "LocationConstraint=$AWS_REGION"
             fi
-            aws s3api wait bucket-exists --bucket "$TF_STATE_BUCKET"
-            aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" \
+            aws s3api wait bucket-exists --bucket "$BUCKET"
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
               --versioning-configuration Status=Enabled
+          else
+            echo "::error::Cannot access state bucket ${BUCKET}: ${probe}"
+            exit 1
           fi
 
       - name: Init
