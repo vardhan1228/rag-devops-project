@@ -55,6 +55,7 @@ resource "aws_lambda_function" "ingest" {
       OPENSEARCH_INDEX    = var.opensearch_index
       EMBED_MODEL_ID      = var.embed_model_id
       EMBED_DIMENSION     = tostring(var.embed_dimension)
+      DOCUMENTS_BUCKET    = aws_s3_bucket.documents.id
       LOG_LEVEL           = "INFO"
     }
   }

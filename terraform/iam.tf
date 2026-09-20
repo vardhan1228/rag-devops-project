@@ -52,9 +52,16 @@ data "aws_iam_policy_document" "rag_runtime" {
   }
 
   statement {
-    sid       = "AccessSearchIndex"
-    effect    = "Allow"
-    actions   = ["es:ESHttpGet", "es:ESHttpPost", "es:ESHttpPut", "es:ESHttpHead"]
+    sid    = "AccessSearchIndex"
+    effect = "Allow"
+    actions = [
+      "es:ESHttpGet",
+      "es:ESHttpPost",
+      "es:ESHttpPut",
+      "es:ESHttpHead",
+      # Required to drop the index during a full reindex.
+      "es:ESHttpDelete",
+    ]
     resources = ["${aws_opensearch_domain.vectors.arn}/*"]
   }
 

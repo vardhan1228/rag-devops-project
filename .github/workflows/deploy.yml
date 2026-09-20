@@ -392,10 +392,11 @@ jobs:
             --cluster "$(terraform -chdir=terraform output -raw ecs_cluster_name)" \
             --services "$(terraform -chdir=terraform output -raw ecs_service_name)"
 
-      # Uploading under uploads/ fires the S3 notification, so the ingest Lambda
-      # indexes each file. --size-only keeps re-runs cheap; passage ids are
-      # deterministic so re-ingesting the same file overwrites rather than
-      # duplicating.
+      # Uploading under uploads/ fires the S3 notification per object, but that
+      # cannot remove passages for documents no longer in the bucket. So sync
+      # first, then run one reindex invocation that drops the index and rebuilds
+      # it from the bucket. One invocation also avoids the concurrent index
+      # creation contention that per-object triggers cause.
       - name: Upload the sample corpus
         run: |
           set -euo pipefail
@@ -403,6 +404,42 @@ jobs:
           aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
           echo "Corpus objects now in the bucket:"
           aws s3 ls "s3://${BUCKET}/uploads/"
+          echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+
+      - name: Rebuild the search index from the bucket
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          FUNC=$(terraform -chdir=terraform output -raw ingest_lambda_name)
+
+          aws lambda invoke \
+            --function-name "$FUNC" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
+            --cli-read-timeout 600 \
+            reindex.json >/dev/null
+
+          cat reindex.json | jq .
+
+          # A Lambda error surfaces as an errorMessage key, not a failed exit code.
+          if jq -e 'has("errorMessage")' reindex.json >/dev/null; then
+            echo "::error::Reindex failed: $(jq -r .errorMessage reindex.json)"
+            exit 1
+          fi
+
+          indexed=$(jq -r '.indexed // 0' reindex.json)
+          failed=$(jq -r '.failed // 0' reindex.json)
+          docs=$(jq -r '.documents // 0' reindex.json)
+          echo "Indexed ${indexed} passage(s) from ${docs} document(s), ${failed} failed."
+
+          if [ "$indexed" -lt 1 ]; then
+            echo "::error::Reindex wrote no passages"
+            exit 1
+          fi
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::${failed} passage(s) failed to index"
+            exit 1
+          fi
 
       - name: Collect outputs
         id: outputs
@@ -445,8 +482,8 @@ jobs:
           curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'RAG Console'
           echo "UI served."
 
-      # Ingestion is asynchronous: the sync in the previous job only triggered
-      # Lambda invocations. Poll until the index exists before querying.
+      # Ingestion already completed synchronously in the reindex step, but the
+      # tasks may have been replaced, so confirm the service can see the index.
       - name: Wait for the corpus to be indexed
         run: |
           URL="${{ needs.apply.outputs.web_url }}"
@@ -469,7 +506,7 @@ jobs:
           set -euo pipefail
           body=$(curl -s -m 90 -X POST \
             -H 'content-type: application/json' \
-            -d '{"question":"How are documents chunked before embedding?","k":5}' \
+            -d '{"question":"What is the customer liability for an unauthorised card transaction reported within three working days?","k":5}' \
             "${{ needs.apply.outputs.web_url }}/query")
 
           echo "$body" | jq .

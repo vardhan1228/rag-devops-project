@@ -7,6 +7,7 @@ from typing import Iterable, Sequence
 
 import boto3
 from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
+from opensearchpy.exceptions import TransportError
 from requests_aws4auth import AWS4Auth
 
 from app.ingestion.chunker import Chunk
@@ -63,10 +64,38 @@ def get_client(endpoint: str | None = None) -> OpenSearch:
 
 
 def ensure_index(client: OpenSearch, index: str = OPENSEARCH_INDEX) -> bool:
-    """Create the index if missing. Returns True when it was created."""
+    """Create the index if missing. Returns True when this call created it.
+
+    Check-then-create is not atomic. When several ingest invocations start at
+    once they all see the index as absent, all call create, one wins and the
+    rest get a 400 resource_already_exists_exception. Treating that response as
+    success makes concurrent ingestion safe instead of relying on retries.
+    """
     if client.indices.exists(index=index):
         return False
-    client.indices.create(index=index, body=INDEX_BODY)
+    try:
+        client.indices.create(index=index, body=INDEX_BODY)
+        return True
+    except TransportError as exc:
+        if _is_already_exists(exc):
+            return False
+        raise
+
+
+def _is_already_exists(exc: TransportError) -> bool:
+    """True when OpenSearch rejected a create because the index is already there."""
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    return "resource_already_exists_exception" in str(getattr(exc, "error", "")) or (
+        "resource_already_exists_exception" in str(exc)
+    )
+
+
+def delete_index(client: OpenSearch, index: str = OPENSEARCH_INDEX) -> bool:
+    """Drop the index. Returns True if it existed. Used before a full reindex."""
+    if not client.indices.exists(index=index):
+        return False
+    client.indices.delete(index=index)
     return True
 
 
@@ -113,10 +142,61 @@ def index_chunks(
     return {"indexed": success, "failed": len(errors), "index": index, "errors": errors[:5]}
 
 
-def lambda_handler(event: dict, context=None) -> dict:
-    """S3-event entrypoint: load -> chunk -> embed -> index each new object."""
+def reindex_prefix(
+    bucket: str,
+    prefix: str = "uploads/",
+    client: OpenSearch | None = None,
+    embedder: Embedder | None = None,
+    index: str = OPENSEARCH_INDEX,
+) -> dict:
+    """Rebuild the index from scratch for everything under ``prefix``.
+
+    Needed because deleting an object from S3 does not remove its passages from
+    the index. Without a rebuild, a replaced corpus leaves the old passages
+    behind and they keep turning up in results.
+
+    Runs as a single call, so it also avoids the concurrent-create contention
+    that per-object invocations produce.
+    """
     from app.ingestion.chunker import chunk_documents
     from app.ingestion.loader import load_s3
+
+    client = client or get_client()
+    embedder = embedder or get_embedder()
+
+    dropped = delete_index(client, index)
+    ensure_index(client, index)
+
+    docs = [d.to_dict() for d in load_s3(bucket, prefix)]
+    chunks = chunk_documents(docs)
+    summary = index_chunks(chunks, client=client, embedder=embedder, index=index)
+
+    return {
+        "mode": "reindex",
+        "dropped_existing_index": dropped,
+        "documents": len(docs),
+        "sources": sorted({d["id"] for d in docs}),
+        **summary,
+    }
+
+
+def lambda_handler(event: dict, context=None) -> dict:
+    """Ingest entrypoint, with two shapes.
+
+    S3 notification (automatic): indexes each newly created object.
+
+    Manual reindex: ``{"reindex": true, "bucket": "...", "prefix": "uploads/"}``
+    drops the index and rebuilds it from the bucket, so the index matches the
+    corpus exactly. Use this after replacing or deleting source documents.
+    """
+    from app.ingestion.chunker import chunk_documents
+    from app.ingestion.loader import load_s3
+
+    if event.get("reindex"):
+        bucket = event.get("bucket") or os.getenv("DOCUMENTS_BUCKET", "")
+        if not bucket:
+            raise ValueError("reindex needs a bucket, in the event or DOCUMENTS_BUCKET")
+        return {"statusCode": 200, **reindex_prefix(bucket, event.get("prefix", "uploads/"))}
 
     results = []
     for record in event.get("Records", []):
