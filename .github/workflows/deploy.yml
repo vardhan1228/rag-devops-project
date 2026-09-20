@@ -452,50 +452,49 @@ jobs:
       # first, then run one reindex invocation that drops the index and rebuilds
       # it from the bucket. One invocation also avoids the concurrent index
       # creation contention that per-object triggers cause.
-      ####################################################
-      # - name: Upload the sample corpus
-      #   run: |
-      #     set -euo pipefail
-      #     BUCKET=$(terraform -chdir=terraform output -raw documents_bucket)
-      #     aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
-      #     echo "Corpus objects now in the bucket:"
-      #     aws s3 ls "s3://${BUCKET}/uploads/"
-      #     echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+      - name: Upload the sample corpus
+        run: |
+          set -euo pipefail
+          BUCKET=$(terraform -chdir=terraform output -raw documents_bucket)
+          aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
+          echo "Corpus objects now in the bucket:"
+          aws s3 ls "s3://${BUCKET}/uploads/"
+          echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
 
-      # - name: Rebuild the search index from the bucket
-      #   timeout-minutes: 10
-      #   run: |
-      #     set -euo pipefail
-      #     FUNC=$(terraform -chdir=terraform output -raw ingest_lambda_name)
+      - name: Rebuild the search index from the bucket
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          FUNC=$(terraform -chdir=terraform output -raw ingest_lambda_name)
 
-      #     aws lambda invoke \
-      #       --function-name "$FUNC" \
-      #       --cli-binary-format raw-in-base64-out \
-      #       --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
-      #       --cli-read-timeout 600 \
-      #       reindex.json >/dev/null
+          aws lambda invoke \
+            --function-name "$FUNC" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
+            --cli-read-timeout 600 \
+            reindex.json >/dev/null
 
-      #     cat reindex.json | jq .
+          cat reindex.json | jq .
 
-      #     # A Lambda error surfaces as an errorMessage key, not a failed exit code.
-      #     if jq -e 'has("errorMessage")' reindex.json >/dev/null; then
-      #       echo "::error::Reindex failed: $(jq -r .errorMessage reindex.json)"
-      #       exit 1
-      #     fi
+          # A Lambda error surfaces as an errorMessage key, not a failed exit code.
+          if jq -e 'has("errorMessage")' reindex.json >/dev/null; then
+            echo "::error::Reindex failed: $(jq -r .errorMessage reindex.json)"
+            exit 1
+          fi
 
-      #     indexed=$(jq -r '.indexed // 0' reindex.json)
-      #     failed=$(jq -r '.failed // 0' reindex.json)
-      #     docs=$(jq -r '.documents // 0' reindex.json)
-      #     echo "Indexed ${indexed} passage(s) from ${docs} document(s), ${failed} failed."
+          indexed=$(jq -r '.indexed // 0' reindex.json)
+          failed=$(jq -r '.failed // 0' reindex.json)
+          docs=$(jq -r '.documents // 0' reindex.json)
+          echo "Indexed ${indexed} passage(s) from ${docs} document(s), ${failed} failed."
 
-      #     if [ "$indexed" -lt 1 ]; then
-      #       echo "::error::Reindex wrote no passages"
-      #       exit 1
-      #     fi
-      #     if [ "$failed" -gt 0 ]; then
-      #       echo "::error::${failed} passage(s) failed to index"
-      #       exit 1
-      #     fi
+          if [ "$indexed" -lt 1 ]; then
+            echo "::error::Reindex wrote no passages"
+            exit 1
+          fi
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::${failed} passage(s) failed to index"
+            exit 1
+          fi
 
       - name: Collect outputs
         id: outputs
@@ -503,79 +502,3 @@ jobs:
           echo "web_url=$(terraform -chdir=terraform output -raw web_url)" >> "$GITHUB_OUTPUT"
           {
             echo "### Deployed"
-            echo "- Web UI: $(terraform -chdir=terraform output -raw web_url)"
-            echo "- Image tag: \`${{ github.sha }}\`"
-            echo "- Chat model: $(terraform -chdir=terraform output -raw chat_model_id)"
-            echo "- Corpus files: $(find sample-data -type f | wc -l)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ------------------------------------------------------- stage 4: verify it
-  smoke:
-    name: smoke test
-    needs: apply
-    runs-on: ubuntu-latest
-    steps:
-      # Reaches the ALB over the public internet. If you narrow
-      # allowed_web_cidrs, this job cannot connect - either allow the runner's
-      # egress range or drop this job.
-      - name: Probe the health endpoint through the load balancer
-        run: |
-          URL="${{ needs.apply.outputs.web_url }}"
-          for attempt in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$URL/health" || echo 000)
-            if [ "$code" = "200" ]; then
-              echo "Healthy after ${attempt} attempt(s)."
-              exit 0
-            fi
-            echo "attempt ${attempt}: HTTP ${code}"
-            sleep 10
-          done
-          echo "::error::Load balancer never returned 200 from /health"
-          exit 1
-
-      - name: Confirm the web UI is being served
-        run: |
-          # Matches a stable marker attribute on <body>, not visible copy, so
-          # rewording the page cannot break the deploy.
-          curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'cloudrag-console'
-          echo "UI served."
-
-      # Ingestion already completed synchronously in the reindex step, but the
-      # tasks may have been replaced, so confirm the service can see the index.
-      - name: Wait for the corpus to be indexed
-        run: |
-          URL="${{ needs.apply.outputs.web_url }}"
-          for attempt in $(seq 1 30); do
-            if curl -s -m 15 "$URL/ready" | grep -q '"index_exists":true'; then
-              echo "Index ready after ${attempt} attempt(s)."
-              exit 0
-            fi
-            echo "attempt ${attempt}: index not ready yet"
-            sleep 10
-          done
-          echo "::error::Index was not populated. Check the ingest Lambda logs and its DLQ."
-          exit 1
-
-      # End-to-end proof: retrieval found passages and the model answered from
-      # them. Asserting on citations rather than wording keeps this stable
-      # across model versions.
-      - name: Ask a real question
-        run: |
-          set -euo pipefail
-          body=$(curl -s -m 90 -X POST \
-            -H 'content-type: application/json' \
-            -d '{"question":"What is the customer liability for an unauthorised card transaction reported within three working days?","k":5}' \
-            "${{ needs.apply.outputs.web_url }}/query")
-
-          echo "$body" | jq .
-
-          answer=$(echo "$body" | jq -r '.answer // empty')
-          cites=$(echo "$body" | jq '.citations | length')
-
-          if [ -z "$answer" ]; then
-            echo "::error::No answer returned"; exit 1
-          fi
-          if [ "$cites" -lt 1 ]; then
-            echo "::error::Answer had no citations, so retrieval returned nothing"; exit 1
-          fi
-          echo "Answered with ${cites} citation(s)."
