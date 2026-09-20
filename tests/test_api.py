@@ -47,8 +47,8 @@ def _fake_answer(main, monkeypatch):
         main,
         "answer_question",
         lambda question, k, search_fn: Answer(
-            answer="Sentences are packed into a 1000 character window. [1]",
-            citations=[{"marker": 1, "doc_id": "d", "source": "s", "score": 0.5}],
+            answer="Sentences are packed into a **1000** character window. [1]",
+            citations=[{"marker": 1, "title": "Fraud And Disputes", "score": 0.5}],
             model_id="amazon.nova-lite-v1:0",
         ),
     )
@@ -65,7 +65,35 @@ def test_web_ui_is_served_at_root(open_client):
     res = c.get("/")
     assert res.status_code == 200
     assert "text/html" in res.headers["content-type"]
-    assert "RAG Console" in res.text
+    assert "cloudrag-console" in res.text
+
+
+def test_ui_shows_branding(open_client):
+    c, _ = open_client
+    body = c.get("/").text
+    assert "Veerababu Narni" in body
+    assert "Naresh" in body
+    assert "Forward Deployed Engineer" in body
+
+
+def test_ui_never_exposes_storage_locations(open_client):
+    """Citations show document titles, so bucket paths must not appear."""
+    c, _ = open_client
+    body = c.get("/").text
+    assert "s3://" not in body
+    assert ".md" not in body
+    assert "uploads/" not in body
+
+
+def test_query_response_carries_titles_not_keys(open_client, monkeypatch):
+    c, main = open_client
+    _fake_answer(main, monkeypatch)
+
+    body = c.post("/query", json={"question": "why?"}).json()
+    citation = body["citations"][0]
+    assert citation["title"] == "Fraud And Disputes"
+    assert "source" not in citation
+    assert "doc_id" not in citation
 
 
 def test_ui_asks_for_no_credentials(open_client):
@@ -84,7 +112,7 @@ def test_query_works_without_a_key_when_auth_is_off(open_client, monkeypatch):
     res = c.post("/query", json={"question": "How are documents chunked?"})
     assert res.status_code == 200
     body = res.json()
-    assert body["citations"][0]["doc_id"] == "d"
+    assert body["citations"][0]["title"] == "Fraud And Disputes"
     assert body["model_id"] == "amazon.nova-lite-v1:0"
 
 

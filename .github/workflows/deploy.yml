@@ -479,7 +479,9 @@ jobs:
 
       - name: Confirm the web UI is being served
         run: |
-          curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'RAG Console'
+          # Matches a stable marker attribute on <body>, not visible copy, so
+          # rewording the page cannot break the deploy.
+          curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'cloudrag-console'
           echo "UI served."
 
       # Ingestion already completed synchronously in the reindex step, but the

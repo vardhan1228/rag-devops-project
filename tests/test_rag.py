@@ -17,17 +17,62 @@ class FakeConverse:
 
 
 def hits(n=3):
+    """Distinct doc_ids so derived titles differ per hit."""
     return [
-        Hit(id=f"doc::{i}", score=1.0 - i / 10, text=f"chunk {i}", doc_id="doc", source=f"s3://b/doc{i}.md")
+        Hit(
+            id=f"uploads/doc{i}.md::0",
+            score=1.0 - i / 10,
+            text=f"chunk {i}",
+            doc_id=f"uploads/doc{i}.md",
+            source=f"s3://b/uploads/doc{i}.md",
+        )
         for i in range(n)
     ]
 
 
 def test_build_context_numbers_blocks_and_returns_citations():
     context, citations = rag.build_context(hits(2))
-    assert "[1] source: s3://b/doc0.md" in context
-    assert "[2] source: s3://b/doc1.md" in context
+    assert "[1] Doc0" in context
+    assert "[2] Doc1" in context
     assert [c["marker"] for c in citations] == [1, 2]
+    assert [c["title"] for c in citations] == ["Doc0", "Doc1"]
+
+
+def test_context_never_leaks_storage_paths():
+    """The model must not be handed a bucket path it could quote into an answer."""
+    context, citations = rag.build_context(hits(3))
+    assert "s3://" not in context
+    assert ".md" not in context
+    assert all("source" not in c for c in citations)
+
+
+@pytest.mark.parametrize(
+    "doc_id,expected",
+    [
+        ("uploads/05-fraud-and-disputes.md", "Fraud And Disputes"),
+        ("uploads/03-kyc-and-onboarding.md", "KYC And Onboarding"),
+        ("uploads/04-payments-and-limits.md", "Payments And Limits"),
+        ("01-deposit-account-products.md", "Deposit Account Products"),
+        ("notes.txt", "Notes"),
+        ("a/b/c/quarterly_report.pdf", "Quarterly Report"),
+        ("", "Untitled document"),
+    ],
+)
+def test_document_title(doc_id, expected):
+    assert rag.document_title(doc_id) == expected
+
+
+def test_document_title_falls_back_to_source():
+    assert rag.document_title("", "s3://bucket/uploads/07-aml-and-monitoring.md") == "AML And Monitoring"
+
+
+def test_system_prompt_demands_grounding_and_structure():
+    """These instructions are load bearing; losing one changes answer quality."""
+    prompt = rag.SYSTEM_PROMPT
+    assert "Use only the context" in prompt
+    assert "Markdown" in prompt
+    assert "Bold every number" in prompt
+    assert "[1]" in prompt
 
 
 def test_build_context_respects_char_budget():

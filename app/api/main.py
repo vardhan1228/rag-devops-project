@@ -85,8 +85,7 @@ class QueryRequest(BaseModel):
 
 class Citation(BaseModel):
     marker: int
-    doc_id: str
-    source: str
+    title: str
     score: float
 
 
