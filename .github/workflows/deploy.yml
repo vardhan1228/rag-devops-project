@@ -302,6 +302,7 @@ jobs:
       SEED_CORPUS: ${{ needs.bootstrap.outputs.seed_corpus }}
     outputs:
       web_url: ${{ steps.outputs.outputs.web_url }}
+      documents_bucket: ${{ steps.outputs.outputs.documents_bucket }}
     steps:
       - uses: actions/checkout@v4
 
@@ -424,15 +425,27 @@ jobs:
         run: |
           set -euo pipefail
           WEB_URL=$(terraform -chdir=terraform output -raw web_url)
+          BUCKET=$(terraform -chdir=terraform output -raw documents_bucket)
           echo "web_url=${WEB_URL}" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Deployed"
-            echo "- Environment: \`${TF_VAR_environment}\`"
-            echo "- Web UI: ${WEB_URL}"
-            echo "- Image tag: \`${{ github.sha }}\`"
-            echo "- Chat model: $(terraform -chdir=terraform output -raw chat_model_id)"
-            echo "- Corpus seeded by this run: ${SEED_CORPUS}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "documents_bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+
+          # Annotations are rendered at the top of the run page, so the URL is
+          # visible without opening a job log.
+          echo "::notice title=Web UI::${WEB_URL}"
+          echo "::notice title=Documents bucket::s3://${BUCKET}/uploads/"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### Deployed
+
+          | | |
+          |---|---|
+          | Web UI | [${WEB_URL}](${WEB_URL}) |
+          | Environment | \`${TF_VAR_environment}\` |
+          | Image tag | \`${{ github.sha }}\` |
+          | Chat model | \`$(terraform -chdir=terraform output -raw chat_model_id)\` |
+          | Documents bucket | \`s3://${BUCKET}/uploads/\` |
+          | Corpus seeded by this run | \`${SEED_CORPUS}\` |
+          EOF
 
   # -------------------------------------------------------------- verify it
   # Pure HTTP against the deployed stack, so this job needs no AWS access. The
@@ -522,3 +535,40 @@ jobs:
             echo "::error::Answer had no citations, so retrieval returned nothing"; exit 1
           fi
           echo "Answered with ${cites} citation(s)."
+
+      # Runs even when a check above failed, because the URL is exactly what you
+      # want in your hand when something is wrong.
+      - name: Report the endpoints
+        if: always()
+        env:
+          BUCKET: ${{ needs.deploy.outputs.documents_bucket }}
+          VERIFIED: ${{ steps.index.outputs.ready == 'true' }}
+        run: |
+          set -uo pipefail
+          echo "::notice title=RAG console::${WEB_URL}"
+          echo "::notice title=Upload documents to::s3://${BUCKET}/uploads/"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### Endpoints
+
+          | What | Where |
+          |---|---|
+          | Web console | [${WEB_URL}](${WEB_URL}) |
+          | Health | \`${WEB_URL}/health\` |
+          | Readiness | \`${WEB_URL}/ready\` |
+          | Query | \`POST ${WEB_URL}/query\` |
+          | Documents bucket | \`s3://${BUCKET}/uploads/\` |
+
+          Corpus seeded by this run: \`${CORPUS_SEEDED}\`
+          Retrieval verified: \`${VERIFIED}\`
+
+          Ask it something:
+
+          \`\`\`bash
+          curl -s -X POST ${WEB_URL}/query \\
+            -H 'content-type: application/json' \\
+            -d '{"question":"What are the card fees?","k":5}' | jq .
+          \`\`\`
+          EOF
+
+          echo "Web console: ${WEB_URL}"

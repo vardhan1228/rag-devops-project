@@ -48,6 +48,9 @@ credentials
 aws.json
 
 # --------------------------------------------------------------------- misc
+# Rendered GIFs are large and regenerable: run docs/diagrams/render_flow_gif.py.
+# The WebP of the same animation is a tenth of the size and is committed.
+docs/diagrams/*.gif
 .DS_Store
 Thumbs.db
 .idea/
