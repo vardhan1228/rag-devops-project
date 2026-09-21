@@ -1,0 +1,106 @@
+                         ┌──────────────────┐
+                         │      USER        │
+                         │    Browser       │
+                         └────────┬─────────┘
+                                  │
+                           POST /query
+                                  │
+                                  ▼
+                     ┌─────────────────────┐
+                     │ Application Load    │
+                     │ Balancer :80        │
+                     └─────────┬───────────┘
+                               │
+                               ▼
+                     ┌─────────────────────┐
+                     │    ECS Fargate      │
+                     │                     │
+                     │      FastAPI        │
+                     │    RAG Application  │
+                     └─────────┬───────────┘
+                               │
+                     ┌─────────┴─────────┐
+                     │                   │
+                     ▼                   ▼
+              Titan Embed v2        OpenSearch
+                     │                   │
+                     │              Vector Search
+                     │                   │
+                     └─────────┬─────────┘
+                               │
+                         Relevant Chunks
+                               │
+                               ▼
+                         Bedrock Nova
+                               │
+                               ▼
+                       Answer + Citations
+                               │
+                               ▼
+                              ALB
+                               │
+                               ▼
+                             USER
+
+
+        ═══════════════════════════════════════════════
+                  DOCUMENT INGESTION FLOW
+        ═══════════════════════════════════════════════
+
+                         Document
+                            │
+                            ▼
+                     ┌─────────────┐
+                     │     S3      │
+                     │ uploads/    │
+                     └──────┬──────┘
+                            │
+                     ObjectCreated
+                            │
+                            ▼
+                   ┌────────────────┐
+                   │ Lambda Ingest  │
+                   └───────┬────────┘
+                           │
+                    Read S3 object
+                           │
+                           ▼
+                    Extract document
+                           │
+                           ▼
+                       Chunking
+                           │
+                           ▼
+                  Titan Embed v2
+                           │
+                           ▼
+                     Embeddings
+                           │
+                           ▼
+                     OpenSearch
+                           │
+                           ▼
+                    Indexed chunks
+
+
+                 FAILURE PATH
+                       │
+                       ▼
+                 Lambda retry
+                       │
+                  still fails
+                       │
+                       ▼
+                SQS Dead Letter
+                    Queue
+                       │
+                       ▼
+                 Investigation /
+                 reprocessing
+
+
+Supporting:
+ECR → container images
+Secrets Manager → API secrets
+IAM Roles → permissions
+CloudWatch → logs

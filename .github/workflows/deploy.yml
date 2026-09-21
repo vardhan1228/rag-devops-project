@@ -427,6 +427,7 @@ jobs:
           echo "web_url=${WEB_URL}" >> "$GITHUB_OUTPUT"
           {
             echo "### Deployed"
+            echo "- Environment: \`${TF_VAR_environment}\`"
             echo "- Web UI: ${WEB_URL}"
             echo "- Image tag: \`${{ github.sha }}\`"
             echo "- Chat model: $(terraform -chdir=terraform output -raw chat_model_id)"
