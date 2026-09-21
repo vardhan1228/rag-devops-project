@@ -347,21 +347,105 @@
   .meta-row span { display: inline-flex; align-items: center; gap: .35rem; }
   .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); }
 
-  /* ----------------------------------------------------------- skeleton */
-  .skeleton { display: none; }
-  .skeleton.on { display: block; }
-  .sk-line {
-    height: 12px; border-radius: 6px; margin-bottom: .7rem;
-    background: linear-gradient(90deg, rgba(122,143,184,.14) 25%, rgba(122,143,184,.3) 37%, rgba(122,143,184,.14) 63%);
-    background-size: 400% 100%;
-    animation: shimmer 1.4s ease-in-out infinite;
+  /* ---------------------------------------------------------- analyzer */
+  /* The loading state names the actual pipeline stages rather than showing a
+     generic shimmer, so the wait explains what the system is doing. Stage
+     timings are estimates: /query is a single request that returns when it is
+     finished, so there is no progress to stream. The generating stage therefore
+     holds until the response lands instead of pretending to advance. */
+  .analyzer { display: none; }
+  .analyzer.on { display: block; animation: rise .45s cubic-bezier(.2,.7,.3,1) both; }
+
+  .an-top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 1rem; margin-bottom: .9rem;
   }
-  .sk-line:nth-child(1) { width: 92%; }
-  .sk-line:nth-child(2) { width: 100%; }
-  .sk-line:nth-child(3) { width: 76%; }
-  .sk-line:nth-child(4) { width: 88%; }
-  .sk-line:nth-child(5) { width: 54%; }
-  @keyframes shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+  .an-phase { font-size: .95rem; font-weight: 700; letter-spacing: -.01em; }
+  .an-phase .cursor {
+    display: inline-block; width: 2px; height: 1em; margin-left: 3px;
+    background: var(--accent); vertical-align: -.12em;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .an-clock { font-family: var(--mono); font-size: .78rem; color: var(--text-faint); }
+
+  .an-track {
+    height: 4px; border-radius: 3px; overflow: hidden;
+    background: rgba(122,143,184,.18); margin-bottom: 1.1rem;
+  }
+  .an-fill {
+    height: 100%; width: 0; border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2) 60%, var(--brand));
+    background-size: 200% 100%;
+    transition: width .5s cubic-bezier(.2,.8,.2,1);
+    animation: slide 2.2s linear infinite;
+  }
+  @keyframes slide { to { background-position: 200% 50%; } }
+
+  /* vector-space visual: points drifting, nearest neighbours lighting up */
+  .an-canvas {
+    display: block; width: 100%; height: 92px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: rgba(8,12,22,.4); margin-bottom: 1.1rem;
+  }
+  @media (prefers-color-scheme: light) { .an-canvas { background: rgba(255,255,255,.6); } }
+
+  .an-stages { display: grid; gap: .1rem; }
+  .an-stage {
+    display: grid; grid-template-columns: 22px 1fr auto; align-items: center;
+    gap: .7rem; padding: .42rem .2rem; border-radius: 8px;
+    transition: background .3s ease, opacity .3s ease;
+  }
+  .an-stage.pending { opacity: .38; }
+  .an-stage.active  { background: rgba(56,189,248,.08); opacity: 1; }
+  .an-stage.done    { opacity: .72; }
+
+  .an-ico {
+    width: 16px; height: 16px; border-radius: 50%; justify-self: center;
+    border: 2px solid var(--border-strong); position: relative;
+  }
+  .an-stage.active .an-ico {
+    border-color: var(--accent); border-top-color: transparent;
+    animation: spin .7s linear infinite;
+  }
+  .an-stage.done .an-ico {
+    border-color: var(--ok); background: var(--ok);
+    animation: pop .32s cubic-bezier(.2,.9,.3,1.4);
+  }
+  .an-stage.done .an-ico::after {
+    content: ""; position: absolute; left: 3px; top: 1px;
+    width: 4px; height: 8px; border: solid #05140d;
+    border-width: 0 2px 2px 0; transform: rotate(40deg);
+  }
+  @keyframes pop { from { transform: scale(.4); } to { transform: scale(1); } }
+
+  .an-name { font-size: .89rem; font-weight: 600; }
+  .an-stage.active .an-name { color: var(--accent); }
+  .an-note {
+    font-family: var(--mono); font-size: .72rem; color: var(--text-faint);
+    text-align: right; white-space: nowrap;
+  }
+  .an-stage.active .an-note { color: var(--text-dim); }
+
+  @media (max-width: 560px) { .an-note { display: none; } }
+
+  /* --------------------------------------------- generated-text reveal */
+  /* Blocks fade in one after another so the answer arrives the way it was
+     written. Applied to rendered blocks, never to raw HTML, so the escaping
+     done by the Markdown renderer is untouched. */
+  .answer-body > .blk {
+    opacity: 0; transform: translateY(8px);
+    transition: opacity .42s ease, transform .42s ease;
+  }
+  .answer-body > .blk.in { opacity: 1; transform: none; }
+
+  .cite-ref { cursor: pointer; transition: transform .14s ease, filter .14s ease; }
+  .cite-ref:hover { transform: translateY(-1px) scale(1.08); filter: brightness(1.15); }
+  .source-item { transition: border-color .25s ease, background .25s ease, transform .25s ease; }
+  .source-item.lit {
+    border-color: var(--accent); transform: translateX(3px);
+    background: rgba(56,189,248,.1);
+  }
 
   /* ------------------------------------------------------------- footer */
   footer.bottom {
@@ -483,10 +567,14 @@
     </div>
   </form>
 
-  <section class="card skeleton" id="skeleton" aria-hidden="true">
-    <div class="card-head">Thinking</div>
-    <div class="sk-line"></div><div class="sk-line"></div><div class="sk-line"></div>
-    <div class="sk-line"></div><div class="sk-line"></div>
+  <section class="card analyzer" id="analyzer" aria-hidden="true">
+    <div class="an-top">
+      <div class="an-phase" id="anPhase">Analyzing<span class="cursor"></span></div>
+      <div class="an-clock" id="anClock">0.0s</div>
+    </div>
+    <div class="an-track"><div class="an-fill" id="anFill"></div></div>
+    <canvas class="an-canvas" id="anCanvas" aria-hidden="true"></canvas>
+    <div class="an-stages" id="anStages"></div>
   </section>
 
   <section class="card" id="answerCard" aria-labelledby="answerHeading">
@@ -631,6 +719,252 @@
 
   /* --------------------------------------------------------------- UI */
 
+  /* ------------------------------------------------------------------ *
+   * Analysis pipeline.
+   *
+   * The stages mirror what the backend genuinely does, in order. Their timings
+   * are estimates, not telemetry: /query is one request that returns only when
+   * it has finished, so there is nothing to stream. The honest part is that the
+   * generating stage holds, pulsing, until the response actually arrives, and
+   * the clock counts real elapsed time. Nothing claims to be complete before it
+   * is, and the bar stops at 88 percent while waiting.
+   * ------------------------------------------------------------------ */
+
+  function stagesFor(mode, k) {
+    const list = [
+      ["Reading the question", "intent + entities", 260],
+      ["Embedding with Titan Embed v2", "1024-dim vector", 420],
+      ["Scanning the vector index", "k-NN, top " + k, 520]
+    ];
+    if (mode === "hybrid") {
+      list.push(["Keyword pass over the corpus", "BM25", 340]);
+      list.push(["Fusing both rankings", "reciprocal rank fusion", 300]);
+    }
+    list.push(["Assembling grounded context", "numbered passages", 280]);
+    list.push(["Generating with Nova", "temperature 0", -1]);   // -1 = hold
+    list.push(["Checking every claim is cited", "citation map", 300]);
+    return list;
+  }
+
+  const Analyzer = {
+    timers: [],
+    raf: null,
+    tick: null,
+    done: null,
+
+    start(mode, k) {
+      this.stages = stagesFor(mode, k);
+      this.index = 0;
+      this.startedAt = performance.now();
+      this.holdAt = this.stages.findIndex((s) => s[2] === -1);
+
+      const box = $("anStages");
+      box.replaceChildren();
+      this.rows = this.stages.map(([name, note]) => {
+        const row = document.createElement("div");
+        row.className = "an-stage pending";
+        const ico = document.createElement("span");
+        ico.className = "an-ico";
+        const nm = document.createElement("span");
+        nm.className = "an-name";
+        nm.textContent = name;
+        const nt = document.createElement("span");
+        nt.className = "an-note";
+        nt.textContent = note;
+        row.append(ico, nm, nt);
+        box.appendChild(row);
+        return row;
+      });
+
+      $("analyzer").classList.add("on");
+      $("analyzer").setAttribute("aria-hidden", "false");
+      this.tick = setInterval(() => {
+        $("anClock").textContent = ((performance.now() - this.startedAt) / 1000).toFixed(1) + "s";
+      }, 100);
+
+      Vectors.start();
+      this.enter(0);
+    },
+
+    enter(i) {
+      if (i > 0) { this.rows[i - 1].className = "an-stage done"; }
+      if (i >= this.rows.length) { return; }
+      this.rows[i].className = "an-stage active";
+      $("anPhase").firstChild.textContent = this.stages[i][0];
+      Vectors.phase(i, this.holdAt);
+
+      const capped = i >= this.holdAt ? 0.88 : (i + 1) / this.rows.length * 0.88;
+      $("anFill").style.width = (capped * 100).toFixed(0) + "%";
+
+      const wait = this.stages[i][2];
+      if (wait < 0) { return; }                       // hold for the response
+      this.timers.push(setTimeout(() => this.enter(i + 1), reduceMotion ? 40 : wait));
+    },
+
+    /** Response landed: finish the generating stage and the check after it. */
+    finish() {
+      this.clearTimers();
+      if (this.holdAt >= 0) {
+        this.enter(this.holdAt + 1);
+        const last = this.stages.length - 1;
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            this.rows[last].className = "an-stage done";
+            $("anFill").style.width = "100%";
+            $("anPhase").firstChild.textContent = "Done";
+            setTimeout(() => { this.stop(); resolve(); }, reduceMotion ? 10 : 260);
+          }, reduceMotion ? 20 : 340);
+        });
+      }
+      this.stop();
+      return Promise.resolve();
+    },
+
+    fail() { this.clearTimers(); this.stop(); },
+
+    clearTimers() {
+      this.timers.forEach(clearTimeout);
+      this.timers = [];
+    },
+
+    stop() {
+      this.clearTimers();
+      clearInterval(this.tick);
+      Vectors.stop();
+      $("analyzer").classList.remove("on");
+      $("analyzer").setAttribute("aria-hidden", "true");
+    }
+  };
+
+  /* ------------------------------------------------------------------ *
+   * Vector-space visual. Points drift; during retrieval the ones nearest the
+   * query converge and link up. Decorative, and skipped entirely when the OS
+   * asks for reduced motion.
+   * ------------------------------------------------------------------ */
+  const Vectors = {
+    running: false,
+    mode: 0,
+
+    start() {
+      if (reduceMotion) { return; }
+      const c = $("anCanvas");
+      const dpr = window.devicePixelRatio || 1;
+      this.w = c.clientWidth;
+      this.h = c.clientHeight;
+      c.width = this.w * dpr;
+      c.height = this.h * dpr;
+      this.ctx = c.getContext("2d");
+      this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      this.pts = Array.from({ length: 44 }, () => ({
+        x: Math.random() * this.w,
+        y: Math.random() * this.h,
+        vx: (Math.random() - 0.5) * 0.35,
+        vy: (Math.random() - 0.5) * 0.35,
+        r: 1 + Math.random() * 1.8,
+        hit: false
+      }));
+      // the query point sits in the middle; "nearest" points gravitate to it
+      this.q = { x: this.w / 2, y: this.h / 2 };
+      this.pts.slice(0, 6).forEach((p) => { p.hit = true; });
+      this.running = true;
+      this.mode = 0;
+      this.loop();
+    },
+
+    phase(i, holdAt) { this.mode = i >= 2 && i < holdAt ? 1 : (i >= holdAt ? 2 : 0); },
+
+    loop() {
+      if (!this.running) { return; }
+      const { ctx, w, h } = this;
+      ctx.clearRect(0, 0, w, h);
+
+      for (const p of this.pts) {
+        if (this.mode >= 1 && p.hit) {
+          p.x += (this.q.x - p.x) * 0.012;
+          p.y += (this.q.y - p.y) * 0.012;
+        } else {
+          p.x += p.vx; p.y += p.vy;
+          if (p.x < 0 || p.x > w) { p.vx *= -1; }
+          if (p.y < 0 || p.y > h) { p.vy *= -1; }
+        }
+      }
+
+      if (this.mode >= 1) {
+        for (const p of this.pts) {
+          if (!p.hit) { continue; }
+          const d = Math.hypot(p.x - this.q.x, p.y - this.q.y);
+          ctx.strokeStyle = "rgba(56,189,248," + Math.max(0, 0.5 - d / 260).toFixed(3) + ")";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(this.q.x, this.q.y);
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+        }
+      }
+
+      for (const p of this.pts) {
+        ctx.fillStyle = p.hit && this.mode >= 1 ? "rgba(56,189,248,.95)" : "rgba(122,143,184,.42)";
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      const t = performance.now() / 420;
+      const pulse = 5 + Math.sin(t) * 2;
+      ctx.strokeStyle = this.mode >= 2 ? "rgba(255,122,26,.9)" : "rgba(129,140,248,.9)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(this.q.x, this.q.y, pulse, 0, Math.PI * 2);
+      ctx.stroke();
+
+      this.raf = requestAnimationFrame(() => this.loop());
+    },
+
+    stop() {
+      this.running = false;
+      if (this.raf) { cancelAnimationFrame(this.raf); }
+    }
+  };
+
+  /** Fade the rendered blocks in one by one, so the answer lands as it reads. */
+  function revealBlocks(host) {
+    const blocks = Array.from(host.children);
+    blocks.forEach((b) => b.classList.add("blk"));
+    if (reduceMotion) {
+      blocks.forEach((b) => b.classList.add("in"));
+      return;
+    }
+    blocks.forEach((b, i) => setTimeout(() => b.classList.add("in"), 70 + i * 85));
+  }
+
+  /** Hovering a [n] marker lights the matching source row, and the reverse. */
+  function linkCitations() {
+    const rows = Array.from(document.querySelectorAll(".source-item"));
+    const marks = Array.from(document.querySelectorAll(".cite-ref"));
+    const lit = (n, on) => {
+      rows.forEach((r) => {
+        if (r.dataset.marker === String(n)) { r.classList.toggle("lit", on); }
+      });
+      marks.forEach((m) => {
+        if (m.textContent === String(n)) { m.classList.toggle("lit", on); }
+      });
+    };
+    marks.forEach((m) => {
+      const n = m.textContent;
+      m.addEventListener("mouseenter", () => lit(n, true));
+      m.addEventListener("mouseleave", () => lit(n, false));
+      m.addEventListener("click", () => {
+        const row = rows.find((r) => r.dataset.marker === String(n));
+        if (row) { row.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "center" }); }
+      });
+    });
+    rows.forEach((r) => {
+      r.addEventListener("mouseenter", () => lit(r.dataset.marker, true));
+      r.addEventListener("mouseleave", () => lit(r.dataset.marker, false));
+    });
+  }
+
   function setStatus(message, kind) {
     const el = $("status");
     el.textContent = message;
@@ -641,7 +975,6 @@
     $("askBtn").disabled = on;
     $("askBtn").classList.toggle("busy", on);
     $("spinner").classList.toggle("on", on);
-    $("skeleton").classList.toggle("on", on);
     if (on) { $("answerCard").classList.remove("on"); }
   }
 
@@ -662,6 +995,7 @@
     citations.forEach((c, idx) => {
       const li = document.createElement("li");
       li.className = "source-item";
+      li.dataset.marker = String(c.marker);
       li.style.animationDelay = (reduceMotion ? 0 : 0.06 * idx) + "s";
 
       const num = document.createElement("span");
@@ -737,7 +1071,8 @@
     if (!question) { return; }
 
     busy(true);
-    setStatus("Embedding the question, searching, then generating\u2026");
+    setStatus("");
+    Analyzer.start($("mode").value, Number($("k").value));
     const started = performance.now();
 
     try {
@@ -759,16 +1094,24 @@
         throw new Error("Request failed (" + res.status + "): " + detail);
       }
 
+      // Let the pipeline close out its last two stages before the answer
+      // appears, so the transition reads as completion rather than a jump cut.
+      await Analyzer.finish();
+
       const elapsed = performance.now() - started;
-      $("answer").innerHTML = renderMarkdown(payload.answer || "");
+      const host = $("answer");
+      host.innerHTML = renderMarkdown(payload.answer || "");
       renderSources(payload.citations);
       renderMeta(payload, elapsed);
+      linkCitations();
 
       busy(false);
       $("answerCard").classList.add("on");
-      setStatus("Done in " + (elapsed / 1000).toFixed(1) + "s", "ok");
+      revealBlocks(host);
+      setStatus("Answered in " + (elapsed / 1000).toFixed(1) + "s", "ok");
       $("answerCard").scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
     } catch (err) {
+      Analyzer.fail();
       busy(false);
       setStatus(err.message, "error");
     }
