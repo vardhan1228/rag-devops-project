@@ -122,23 +122,39 @@ overwrites the same index documents instead of duplicating them.
 
 ![Deployment pipeline](diagrams/05-deployment-pipeline.png)
 
-Seven stages, cheapest checks first. Lint and validate need no AWS access at all,
+Six jobs, cheapest checks first. Lint and validate need no AWS access at all,
 so a typo fails in under a minute without touching the account.
 
-The apply is split for a specific reason: Terraform creates the ECR repository,
-but the ECS service and the Lambda both reference an image tag inside it. A
-single apply fails on first run because the tag does not exist yet. So stage 3
-applies only the repository, stage 4 pushes an image tagged with the commit SHA,
-and stage 5 applies everything else pointing at that tag.
+`bootstrap` then proves the credentials work and creates the hardened state
+bucket, and publishes the two settings the later jobs need: the bucket name and
+whether to seed the corpus. Deciding both in one place is what keeps the rest of
+the file short, since no other job has to derive them.
+
+`deploy` is a single job that applies in three phases, for a specific reason:
+Terraform creates the ECR repository, but the ECS service and the Lambda both
+reference an image tag inside it, and a single apply fails on first run because
+the tag does not exist yet. So it applies only the repository, pushes an image
+tagged with the commit SHA, then applies everything else pointing at that tag.
+That is step ordering rather than a reason for separate jobs, so it authenticates
+and runs `terraform init` once, and the environment approval gate covers the
+whole deployment instead of only its last phase.
 
 Because tags are immutable and equal to the commit SHA, the running code is
 never ambiguous, and rollback is redeploying a known tag.
 
-The last stage earns its place. It asserts the load balancer returns 200, the UI
-is actually being served, the index is populated, and a real question comes back
-with citations. That last assertion covers the whole path end to end: S3 event,
-Lambda, embeddings, OpenSearch k-NN, and generation. A deployment that starts
-cleanly but cannot answer anything fails the build.
+Seeding the corpus is optional. Set the `SEED_CORPUS` repository variable to
+`false`, or untick "Seed the corpus" on a manual run, when you manage the
+documents in the bucket yourself: the sync and reindex steps are skipped and
+whatever is already indexed is left untouched. Nothing in the running service
+depends on them, so the deployment is unaffected either way.
+
+The last job earns its place. It asserts the load balancer returns 200 and the
+UI is actually being served. When this run seeded the corpus, it additionally
+requires a populated index and a real question coming back with citations, which
+covers the whole path end to end: S3 event, Lambda, embeddings, OpenSearch k-NN,
+and generation. A deployment that starts cleanly but cannot answer anything fails
+the build. With seeding turned off there is nothing to promise about the index,
+so an empty one is reported as a notice and the retrieval check is skipped.
 
 ---
 

@@ -7,27 +7,29 @@ flowchart TB
   subgraph gha["GitHub Actions · deploy workflow"]
     direction TB
 
-    subgraph q["Stage 1 · no AWS access, fails fast"]
+    subgraph q["no AWS access, fails fast"]
       direction LR
       test["lint<br/>ruff<br/>Python 3.12"]
       val["validate<br/>terraform fmt -check<br/>terraform validate<br/>with -backend=false"]
     end
 
-    boot["Stage 2 · bootstrap<br/>sts get-caller-identity<br/>assert it matches AWS_ACCOUNT_ID<br/>create state bucket if absent<br/>versioning · SSE · TLS-only policy"]
+    boot["bootstrap<br/>sts get-caller-identity<br/>assert it matches AWS_ACCOUNT_ID<br/>create state bucket if absent<br/>versioning · SSE · TLS-only policy<br/>publish bucket name + seed decision"]
 
-    reg["Stage 3 · apply-registry<br/>terraform apply<br/>-target aws_ecr_repository.api<br/>nothing else yet"]
+    subgraph d["deploy · one job, four phases"]
+      direction TB
+      reg["1 · registry<br/>terraform apply<br/>-target aws_ecr_repository.api<br/>nothing else yet"]
+      build["2 · image<br/>docker buildx build and push<br/>tag is the commit SHA<br/>provenance false, Lambda needs it"]
+      app["3 · workloads<br/>terraform apply, full<br/>TF_VAR_image_tag=SHA<br/>then wait services-stable"]
+      data["4 · corpus · optional<br/>skipped when SEED_CORPUS=false<br/>aws s3 sync --delete<br/>invoke Lambda reindex<br/>fail if 0 indexed or any failed"]
+      reg --> build --> app --> data
+    end
 
-    build["Stage 4 · build<br/>docker buildx build and push<br/>tag is the commit SHA<br/>provenance false, Lambda needs it"]
-
-    app["Stage 5 · apply<br/>terraform apply, full<br/>-var image_tag=SHA<br/>-var builder_enabled=false<br/>then wait services-stable"]
-
-    data["Stage 6 · corpus<br/>aws s3 sync --delete<br/>invoke Lambda reindex<br/>fail if 0 indexed or any failed"]
-
-    smoke["Stage 7 · smoke<br/>/health returns 200<br/>UI contains RAG Console<br/>/ready shows index_exists<br/>real question returns citations"]
+    smoke["smoke<br/>/health returns 200<br/>UI contains RAG Console<br/>/ready shows index_exists<br/>real question returns citations<br/>last two only when phase 4 ran"]
 
     test --> boot
     val --> boot
-    boot --> reg --> build --> app --> data --> smoke
+    boot --> reg
+    data --> smoke
   end
 
   subgraph awsres["AWS"]

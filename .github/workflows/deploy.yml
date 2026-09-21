@@ -1,29 +1,39 @@
 name: deploy
 
-# Deployment order matters here. Terraform owns the ECR repository, but ECS and
-# Lambda cannot start until an image exists inside it. So the apply is split:
+# Six jobs, cheapest first. Nothing touches AWS until lint and validate pass.
 #
-#   1. lint / validate        - fail fast before touching AWS
-#   2. bootstrap              - verify credentials, create the state bucket
-#   3. plan (PRs only)        - review-only, no changes applied
-#   4. apply-registry         - create just the ECR repository
-#   5. build                  - build and push the image, tagged with the SHA
-#   6. apply                  - full apply, wiring workloads to that image
-#   7. smoke                  - prove the deployed stack actually answers
+#   lint ------+
+#   validate --+-- bootstrap --+-- plan            (pull requests, no changes)
+#                             |
+#                             +-- deploy -- smoke  (pushes and manual runs)
 #
-# The build host EC2 instance is disabled in CI (builder_enabled=false) because
-# GitHub runners already have Docker.
+# bootstrap resolves two things every later job needs, so they are decided in
+# exactly one place: the state bucket name and whether to seed the corpus.
+#
+# deploy is one job on purpose. Terraform owns the ECR repository, but the ECS
+# service and the Lambda reference an image tag inside it, so a single apply
+# fails on a fresh account because the tag does not exist yet. The fix is step
+# ordering, not separate jobs: apply the repository, push the image tagged with
+# the commit SHA, then apply everything else pointing at that tag. Keeping it
+# in one job means one authentication and one terraform init instead of three,
+# and the environment approval gate covers the whole deployment rather than
+# just the last part of it.
+#
+# Managing the corpus. Set the SEED_CORPUS repository variable to false, or
+# untick "Seed the corpus" on a manual run, when you upload documents to the
+# bucket yourself. The sync and reindex steps are skipped, whatever is already
+# indexed is left alone, and smoke reports an empty index as a notice instead
+# of failing. Nothing in the running service depends on those steps. With
+# seeding on, smoke holds the pipeline to the stricter promise: retrieval must
+# come back with citations.
 #
 # Credentials: long-lived IAM user access keys held as repository secrets.
 #   Secrets   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-#   Variables AWS_ACCOUNT_ID (optional), TF_STATE_BUCKET (optional override)
+#   Variables AWS_ACCOUNT_ID, TF_STATE_BUCKET, SEED_CORPUS  (all optional)
 #
 # AWS_ACCOUNT_ID is not a secret; it is asserted against the caller identity so
 # a swapped key cannot quietly deploy into a different account. Because these
 # keys never expire on their own, rotate them on a schedule.
-#
-# Every job that runs `terraform init` creates the state bucket first, so the
-# backend always exists even when a single job is re-run on its own.
 
 on:
   push:
@@ -37,6 +47,10 @@ on:
         type: choice
         options: [dev, staging, prod]
         default: dev
+      seed_corpus:
+        description: Seed the corpus (upload sample-data/ and rebuild the index)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -46,14 +60,15 @@ env:
   TF_VERSION: 1.15.5
   PYTHON_VERSION: "3.12"
   TF_IN_AUTOMATION: "true"
-  # Base name for the Terraform state bucket. The AWS account id is appended at
-  # runtime. S3 bucket names are globally unique across every AWS account, so a
-  # bare name created under one account cannot be created or read from another:
-  # HeadBucket answers 403, not 404, which looks like a permissions fault.
-  # Appending the account id keeps the name unique and survives account changes.
+  # Base name for the state bucket. S3 names are global, so bootstrap appends
+  # the account id; see the comment there.
   TF_STATE_BUCKET_BASE: ${{ vars.TF_STATE_BUCKET || 'dev-genai-cloudrag' }}
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-  TF_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+  # Terraform reads TF_VAR_* from the environment, so every plan and apply
+  # below picks these up without repeating -var flags. GitHub runners already
+  # have Docker, so the build host EC2 instance stays off in CI.
+  TF_VAR_environment: ${{ inputs.environment || 'dev' }}
+  TF_VAR_builder_enabled: "false"
 
 # Never let two deployments race for the same state lock.
 concurrency:
@@ -61,7 +76,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------- quality
+  # ---------------------------------------------------- no AWS access needed
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -101,10 +116,15 @@ jobs:
           terraform -chdir=terraform validate
 
   # --------------------------------------------------------------- bootstrap
+  # Proves the credentials work and the backend exists before any later job
+  # spends real time, and publishes the two settings they all depend on.
   bootstrap:
     name: credentials & state bucket
     needs: [lint, validate]
     runs-on: ubuntu-latest
+    outputs:
+      state_bucket: ${{ steps.bucket.outputs.name }}
+      seed_corpus: ${{ steps.settings.outputs.seed_corpus }}
     steps:
       # Secrets are passed through env, never interpolated into the shell, so a
       # value containing shell metacharacters cannot be executed.
@@ -118,6 +138,26 @@ jobs:
             exit 1
           fi
 
+      - name: Decide whether to seed the corpus
+        id: settings
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT: ${{ inputs.seed_corpus }}
+          VARIABLE: ${{ vars.SEED_CORPUS }}
+        run: |
+          set -euo pipefail
+          # A manual run states it explicitly, including "no"; anything else
+          # falls back to the repository variable, which defaults to seeding.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            seed="$INPUT"
+          elif [ "${VARIABLE,,}" = "false" ]; then
+            seed=false
+          else
+            seed=true
+          fi
+          echo "seed_corpus=${seed}" >> "$GITHUB_OUTPUT"
+          echo "Seed the corpus: ${seed}"
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -127,22 +167,34 @@ jobs:
       # Fails in seconds if the keys are wrong, rather than midway through a
       # 20-minute apply. Also refuses to run against an unexpected account.
       - name: Verify the caller identity
+        id: identity
         run: |
+          set -euo pipefail
           ACTUAL=$(aws sts get-caller-identity --query Account --output text)
           echo "Authenticated to account ${ACTUAL} as $(aws sts get-caller-identity --query Arn --output text)"
           if [ -n "${AWS_ACCOUNT_ID}" ] && [ "${ACTUAL}" != "${AWS_ACCOUNT_ID}" ]; then
             echo "::error::Credentials resolve to ${ACTUAL} but AWS_ACCOUNT_ID is ${AWS_ACCOUNT_ID}. Refusing to deploy."
             exit 1
           fi
+          echo "account=${ACTUAL}" >> "$GITHUB_OUTPUT"
 
+      # S3 bucket names are globally unique across every AWS account, so a bare
+      # name created under one account cannot be created or read from another:
+      # HeadBucket answers 403, not 404, which looks like a permissions fault.
+      # Appending the account id keeps the name unique and survives account
+      # changes. The name is published as a job output, so later jobs pass it
+      # to terraform init instead of each deriving it again.
+      #
       # State holds secrets in plaintext, so versioning, encryption, a public
-      # access block and TLS-only access are requirements, not extras. Re-run
-      # safe: settings are reapplied even when the bucket already exists.
-      - name: Create the Terraform state bucket
+      # access block and TLS-only access are requirements, not extras. All of
+      # it is reapplied every run, so a bucket created by an older version of
+      # this workflow is brought up to the same standard.
+      - name: Create the state bucket
+        id: bucket
+        env:
+          ACCOUNT: ${{ steps.identity.outputs.account }}
         run: |
           set -euo pipefail
-
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
           BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
           echo "State bucket: ${BUCKET}"
 
@@ -194,6 +246,8 @@ jobs:
             }]
           }"
 
+          echo "name=${BUCKET}" >> "$GITHUB_OUTPUT"
+
   # ------------------------------------------------------ pull requests only
   plan:
     name: plan (review only)
@@ -213,48 +267,16 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # Resolves the same account-scoped name the bootstrap job created, and
-      # exports it so the init step below uses it. Creating it here too keeps
-      # this job correct when it is re-run on its own.
-      - name: Resolve and ensure the state bucket
-        run: |
-          set -euo pipefail
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
-          echo "TF_STATE_BUCKET=${BUCKET}" >> "$GITHUB_ENV"
-          echo "State bucket: ${BUCKET}"
-
-          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
-            echo "Bucket is present."
-          elif printf '%s' "$probe" | grep -q '404'; then
-            if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$BUCKET"
-            else
-              aws s3api create-bucket --bucket "$BUCKET" \
-                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
-            fi
-            aws s3api wait bucket-exists --bucket "$BUCKET"
-            aws s3api put-bucket-versioning --bucket "$BUCKET" \
-              --versioning-configuration Status=Enabled
-          else
-            echo "::error::Cannot access state bucket ${BUCKET}: ${probe}"
-            exit 1
-          fi
-
       - name: Init
         run: |
           terraform -chdir=terraform init -input=false \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="bucket=${{ needs.bootstrap.outputs.state_bucket }}" \
             -backend-config="region=$AWS_REGION"
 
-      # Plans against whatever image is currently deployed, so an unpushed tag
-      # cannot make the diff look artificially large.
+      # No image_tag is set, so this plans against whatever is deployed now and
+      # an unpushed tag cannot make the diff look artificially large.
       - name: Plan
-        run: |
-          terraform -chdir=terraform plan -input=false -lock-timeout=5m -no-color \
-            -var="environment=$TF_ENVIRONMENT" \
-            -var="builder_enabled=false" \
-            | tee plan.txt
+        run: terraform -chdir=terraform plan -input=false -lock-timeout=5m -no-color | tee plan.txt
 
       - name: Summarize the plan
         run: |
@@ -265,114 +287,19 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # --------------------------------------------------- stage 1: the registry
-  apply-registry:
-    name: create ECR repository
+  # -------------------------------------------------------------- the deploy
+  deploy:
+    name: build & apply
     needs: bootstrap
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    outputs:
-      repository: ${{ steps.ecr.outputs.repository }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      # Resolves the same account-scoped name the bootstrap job created, and
-      # exports it so the init step below uses it. Creating it here too keeps
-      # this job correct when it is re-run on its own.
-      - name: Resolve and ensure the state bucket
-        run: |
-          set -euo pipefail
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
-          echo "TF_STATE_BUCKET=${BUCKET}" >> "$GITHUB_ENV"
-          echo "State bucket: ${BUCKET}"
-
-          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
-            echo "Bucket is present."
-          elif printf '%s' "$probe" | grep -q '404'; then
-            if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$BUCKET"
-            else
-              aws s3api create-bucket --bucket "$BUCKET" \
-                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
-            fi
-            aws s3api wait bucket-exists --bucket "$BUCKET"
-            aws s3api put-bucket-versioning --bucket "$BUCKET" \
-              --versioning-configuration Status=Enabled
-          else
-            echo "::error::Cannot access state bucket ${BUCKET}: ${probe}"
-            exit 1
-          fi
-
-      - name: Init
-        run: |
-          terraform -chdir=terraform init -input=false \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
-            -backend-config="region=$AWS_REGION"
-
-      # -target builds only the dependency closure, which is exactly what is
-      # wanted here. The full apply in a later stage fills in everything else.
-      - name: Apply the repository only
-        run: |
-          terraform -chdir=terraform apply -input=false -auto-approve -lock-timeout=5m \
-            -var="environment=$TF_ENVIRONMENT" \
-            -var="builder_enabled=false" \
-            -target=aws_ecr_repository.api
-
-      - name: Export the repository URL
-        id: ecr
-        run: |
-          URL=$(terraform -chdir=terraform output -raw ecr_repository_url)
-          echo "repository=$URL" >> "$GITHUB_OUTPUT"
-
-  # ------------------------------------------------------ stage 2: the image
-  build:
-    name: build & push image
-    needs: apply-registry
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: aws-actions/amazon-ecr-login@v2
-
-      - uses: docker/setup-buildx-action@v3
-
-      # The repository uses immutable tags, so the commit SHA is the tag.
-      # provenance=false keeps the manifest in the single-image format that
-      # Lambda requires.
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          provenance: false
-          tags: ${{ needs.apply-registry.outputs.repository }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # --------------------------------------------------- stage 3: the workloads
-  apply:
-    name: terraform apply
-    needs: build
-    runs-on: ubuntu-latest
     # Add required reviewers to this environment in repo settings to gate prod.
     environment: ${{ inputs.environment || 'dev' }}
+    env:
+      # Immutable tags, so the commit SHA is the tag and the running code is
+      # never ambiguous. Rollback is redeploying a known tag.
+      TF_VAR_image_tag: ${{ github.sha }}
+      SEED_CORPUS: ${{ needs.bootstrap.outputs.seed_corpus }}
     outputs:
       web_url: ${{ steps.outputs.outputs.web_url }}
     steps:
@@ -388,47 +315,43 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      # Resolves the same account-scoped name the bootstrap job created, and
-      # exports it so the init step below uses it. Creating it here too keeps
-      # this job correct when it is re-run on its own.
-      - name: Resolve and ensure the state bucket
-        run: |
-          set -euo pipefail
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="${TF_STATE_BUCKET_BASE}-${ACCOUNT}"
-          echo "TF_STATE_BUCKET=${BUCKET}" >> "$GITHUB_ENV"
-          echo "State bucket: ${BUCKET}"
-
-          if probe=$(aws s3api head-bucket --bucket "$BUCKET" 2>&1); then
-            echo "Bucket is present."
-          elif printf '%s' "$probe" | grep -q '404'; then
-            if [ "$AWS_REGION" = "us-east-1" ]; then
-              aws s3api create-bucket --bucket "$BUCKET"
-            else
-              aws s3api create-bucket --bucket "$BUCKET" \
-                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
-            fi
-            aws s3api wait bucket-exists --bucket "$BUCKET"
-            aws s3api put-bucket-versioning --bucket "$BUCKET" \
-              --versioning-configuration Status=Enabled
-          else
-            echo "::error::Cannot access state bucket ${BUCKET}: ${probe}"
-            exit 1
-          fi
-
       - name: Init
         run: |
           terraform -chdir=terraform init -input=false \
-            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="bucket=${{ needs.bootstrap.outputs.state_bucket }}" \
             -backend-config="region=$AWS_REGION"
 
-      - name: Plan
+      # ---------------------------------------------------------- 1. registry
+      # -target builds only the dependency closure, which is exactly what is
+      # wanted here. The full apply further down fills in everything else.
+      - name: Create the ECR repository
+        id: ecr
         run: |
-          terraform -chdir=terraform plan -input=false -lock-timeout=5m \
-            -var="environment=$TF_ENVIRONMENT" \
-            -var="image_tag=${{ github.sha }}" \
-            -var="builder_enabled=false" \
-            -out=tfplan
+          set -euo pipefail
+          terraform -chdir=terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -target=aws_ecr_repository.api
+          echo "repository=$(terraform -chdir=terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------- 2. image
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # provenance=false keeps the manifest in the single-image format that
+      # Lambda requires.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --------------------------------------------------------- 3. workloads
+      - name: Plan
+        run: terraform -chdir=terraform plan -input=false -lock-timeout=5m -out=tfplan
 
       # A first-run apply creates an OpenSearch domain, which takes 15-25 min.
       - name: Apply
@@ -442,82 +365,93 @@ jobs:
             --cluster "$(terraform -chdir=terraform output -raw ecs_cluster_name)" \
             --services "$(terraform -chdir=terraform output -raw ecs_service_name)"
 
+      # ------------------------------------------------------------ 4. corpus
+      # Optional; see "Managing the corpus" at the top of this file.
+      #
       # Uploading under uploads/ fires the S3 notification per object, but that
       # cannot remove passages for documents no longer in the bucket. So sync
       # first, then run one reindex invocation that drops the index and rebuilds
       # it from the bucket. One invocation also avoids the concurrent index
       # creation contention that per-object triggers cause.
-      ####################################################
-      # - name: Upload the sample corpus
-      #   run: |
-      #     set -euo pipefail
-      #     BUCKET=$(terraform -chdir=terraform output -raw documents_bucket)
-      #     aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
-      #     echo "Corpus objects now in the bucket:"
-      #     aws s3 ls "s3://${BUCKET}/uploads/"
-      #     echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+      - name: Upload the sample corpus
+        if: needs.bootstrap.outputs.seed_corpus == 'true'
+        run: |
+          set -euo pipefail
+          BUCKET=$(terraform -chdir=terraform output -raw documents_bucket)
+          aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
+          echo "Corpus objects now in the bucket:"
+          aws s3 ls "s3://${BUCKET}/uploads/"
+          echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
 
-      # - name: Rebuild the search index from the bucket
-      #   timeout-minutes: 10
-      #   run: |
-      #     set -euo pipefail
-      #     FUNC=$(terraform -chdir=terraform output -raw ingest_lambda_name)
+      - name: Rebuild the search index from the bucket
+        if: needs.bootstrap.outputs.seed_corpus == 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          FUNC=$(terraform -chdir=terraform output -raw ingest_lambda_name)
 
-      #     aws lambda invoke \
-      #       --function-name "$FUNC" \
-      #       --cli-binary-format raw-in-base64-out \
-      #       --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
-      #       --cli-read-timeout 600 \
-      #       reindex.json >/dev/null
+          aws lambda invoke \
+            --function-name "$FUNC" \
+            --cli-binary-format raw-in-base64-out \
+            --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
+            --cli-read-timeout 600 \
+            reindex.json >/dev/null
 
-      #     cat reindex.json | jq .
+          jq . reindex.json
 
-      #     # A Lambda error surfaces as an errorMessage key, not a failed exit code.
-      #     if jq -e 'has("errorMessage")' reindex.json >/dev/null; then
-      #       echo "::error::Reindex failed: $(jq -r .errorMessage reindex.json)"
-      #       exit 1
-      #     fi
+          # A Lambda error surfaces as an errorMessage key, not a failed exit code.
+          if jq -e 'has("errorMessage")' reindex.json >/dev/null; then
+            echo "::error::Reindex failed: $(jq -r .errorMessage reindex.json)"
+            exit 1
+          fi
 
-      #     indexed=$(jq -r '.indexed // 0' reindex.json)
-      #     failed=$(jq -r '.failed // 0' reindex.json)
-      #     docs=$(jq -r '.documents // 0' reindex.json)
-      #     echo "Indexed ${indexed} passage(s) from ${docs} document(s), ${failed} failed."
+          indexed=$(jq -r '.indexed // 0' reindex.json)
+          failed=$(jq -r '.failed // 0' reindex.json)
+          docs=$(jq -r '.documents // 0' reindex.json)
+          echo "Indexed ${indexed} passage(s) from ${docs} document(s), ${failed} failed."
 
-      #     if [ "$indexed" -lt 1 ]; then
-      #       echo "::error::Reindex wrote no passages"
-      #       exit 1
-      #     fi
-      #     if [ "$failed" -gt 0 ]; then
-      #       echo "::error::${failed} passage(s) failed to index"
-      #       exit 1
-      #     fi
+          if [ "$indexed" -lt 1 ]; then
+            echo "::error::Reindex wrote no passages"
+            exit 1
+          fi
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::${failed} passage(s) failed to index"
+            exit 1
+          fi
 
       - name: Collect outputs
         id: outputs
         run: |
-          echo "web_url=$(terraform -chdir=terraform output -raw web_url)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          WEB_URL=$(terraform -chdir=terraform output -raw web_url)
+          echo "web_url=${WEB_URL}" >> "$GITHUB_OUTPUT"
           {
             echo "### Deployed"
-            echo "- Web UI: $(terraform -chdir=terraform output -raw web_url)"
+            echo "- Web UI: ${WEB_URL}"
             echo "- Image tag: \`${{ github.sha }}\`"
             echo "- Chat model: $(terraform -chdir=terraform output -raw chat_model_id)"
-            echo "- Corpus files: $(find sample-data -type f | wc -l)"
+            echo "- Corpus seeded by this run: ${SEED_CORPUS}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ------------------------------------------------------- stage 4: verify it
+  # -------------------------------------------------------------- verify it
+  # Pure HTTP against the deployed stack, so this job needs no AWS access. The
+  # liveness checks always apply; the retrieval check needs a populated index,
+  # so it is only demanded when this run is what populated it.
   smoke:
     name: smoke test
-    needs: apply
+    needs: [bootstrap, deploy]
     runs-on: ubuntu-latest
+    env:
+      WEB_URL: ${{ needs.deploy.outputs.web_url }}
+      CORPUS_SEEDED: ${{ needs.bootstrap.outputs.seed_corpus }}
     steps:
       # Reaches the ALB over the public internet. If you narrow
       # allowed_web_cidrs, this job cannot connect - either allow the runner's
       # egress range or drop this job.
       - name: Probe the health endpoint through the load balancer
         run: |
-          URL="${{ needs.apply.outputs.web_url }}"
           for attempt in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$URL/health" || echo 000)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$WEB_URL/health" || echo 000)
             if [ "$code" = "200" ]; then
               echo "Healthy after ${attempt} attempt(s)."
               exit 0
@@ -532,35 +466,48 @@ jobs:
         run: |
           # Matches a stable marker attribute on <body>, not visible copy, so
           # rewording the page cannot break the deploy.
-          curl -sf -m 15 "${{ needs.apply.outputs.web_url }}/" | grep -q 'cloudrag-console'
+          curl -sf -m 15 "$WEB_URL/" | grep -q 'cloudrag-console'
           echo "UI served."
 
-      # Ingestion already completed synchronously in the reindex step, but the
-      # tasks may have been replaced, so confirm the service can see the index.
-      - name: Wait for the corpus to be indexed
+      # Seeding finished before this job started, but the tasks may have been
+      # replaced since, so confirm the running service can see the index.
+      - name: Check whether the index is populated
+        id: index
         run: |
-          URL="${{ needs.apply.outputs.web_url }}"
-          for attempt in $(seq 1 30); do
-            if curl -s -m 15 "$URL/ready" | grep -q '"index_exists":true'; then
-              echo "Index ready after ${attempt} attempt(s)."
+          set -uo pipefail
+          attempts=30
+          [ "$CORPUS_SEEDED" = "true" ] || attempts=1
+
+          for attempt in $(seq 1 $attempts); do
+            if curl -s -m 15 "$WEB_URL/ready" | grep -q '"index_exists":true'; then
+              echo "Index present after ${attempt} attempt(s)."
+              echo "ready=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "attempt ${attempt}: index not ready yet"
-            sleep 10
+            [ "$attempt" -lt "$attempts" ] && sleep 10
           done
-          echo "::error::Index was not populated. Check the ingest Lambda logs and its DLQ."
-          exit 1
+
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+
+          if [ "$CORPUS_SEEDED" = "true" ]; then
+            echo "::error::This run seeded the corpus but the index was not populated. Check the ingest Lambda logs and its DLQ."
+            exit 1
+          fi
+          echo "::notice::Corpus seeding is off and the index is empty, so the retrieval check is skipped. The service itself is up. Upload documents under uploads/ in the documents bucket, or run this workflow manually with seeding enabled."
 
       # End-to-end proof: retrieval found passages and the model answered from
       # them. Asserting on citations rather than wording keeps this stable
-      # across model versions.
+      # across model versions, and it covers the whole path: S3 event, Lambda,
+      # embeddings, OpenSearch k-NN, and generation.
       - name: Ask a real question
+        if: steps.index.outputs.ready == 'true'
         run: |
           set -euo pipefail
           body=$(curl -s -m 90 -X POST \
             -H 'content-type: application/json' \
             -d '{"question":"What is the customer liability for an unauthorised card transaction reported within three working days?","k":5}' \
-            "${{ needs.apply.outputs.web_url }}/query")
+            "$WEB_URL/query")
 
           echo "$body" | jq .
 
