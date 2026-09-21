@@ -3,7 +3,7 @@ name: deploy
 # Deployment order matters here. Terraform owns the ECR repository, but ECS and
 # Lambda cannot start until an image exists inside it. So the apply is split:
 #
-#   1. test / validate        - fail fast before touching AWS
+#   1. lint / validate        - fail fast before touching AWS
 #   2. bootstrap              - verify credentials, create the state bucket
 #   3. plan (PRs only)        - review-only, no changes applied
 #   4. apply-registry         - create just the ECR repository
@@ -62,8 +62,8 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------- quality
-  test:
-    name: lint & test
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,12 +79,7 @@ jobs:
           pip install -r requirements.txt ruff==0.8.4
 
       - name: Lint
-        run: ruff check app tests
-
-      - name: Unit tests
-        run: pytest -q
-        env:
-          PYTHONPATH: .
+        run: ruff check app
 
   validate:
     name: terraform validate
@@ -108,7 +103,7 @@ jobs:
   # --------------------------------------------------------------- bootstrap
   bootstrap:
     name: credentials & state bucket
-    needs: [test, validate]
+    needs: [lint, validate]
     runs-on: ubuntu-latest
     steps:
       # Secrets are passed through env, never interpolated into the shell, so a

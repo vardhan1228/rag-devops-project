@@ -122,7 +122,7 @@ overwrites the same index documents instead of duplicating them.
 
 ![Deployment pipeline](diagrams/05-deployment-pipeline.png)
 
-Seven stages, cheapest checks first. Lint and tests need no AWS access at all,
+Seven stages, cheapest checks first. Lint and validate need no AWS access at all,
 so a typo fails in under a minute without touching the account.
 
 The apply is split for a specific reason: Terraform creates the ECR repository,

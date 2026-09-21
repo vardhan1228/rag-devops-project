@@ -9,7 +9,7 @@ flowchart TB
 
     subgraph q["Stage 1 · no AWS access, fails fast"]
       direction LR
-      test["test<br/>ruff + pytest<br/>Python 3.12"]
+      test["lint<br/>ruff<br/>Python 3.12"]
       val["validate<br/>terraform fmt -check<br/>terraform validate<br/>with -backend=false"]
     end
 
