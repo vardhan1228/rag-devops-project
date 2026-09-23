@@ -215,3 +215,11 @@ jobs:
           # not only inside this step's collapsed log.
           echo "::notice title=Web URL::${WEB_URL}"
           echo "${WEB_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Last stage of the pipeline: nothing but the URL, in a banner that is
+      # easy to spot when scrolling the log.
+      - name: Web URL
+        run: |
+          echo "=============================================================="
+          echo "  WEB URL: ${{ steps.info.outputs.web_url }}"
+          echo "=============================================================="
