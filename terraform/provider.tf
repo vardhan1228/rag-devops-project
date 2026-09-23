@@ -13,24 +13,9 @@ terraform {
     }
   }
 
-  /**
-   * Remote state lives in an S3 bucket you create once, by hand:
-   *
-   *   aws s3api create-bucket --bucket <your-bucket> --region us-east-1
-   *   aws s3api put-bucket-versioning --bucket <your-bucket> \
-   *     --versioning-configuration Status=Enabled
-   *
-   * The bucket name is supplied at init time, so the same code works in any
-   * account:
-   *
-   *   terraform init -backend-config="bucket=<your-bucket>" \
-   *                  -backend-config="region=us-east-1"
-   *
-   * use_lockfile is S3-native state locking, so no DynamoDB table is needed.
-   * To check syntax without any backend at all: terraform init -backend=false
-   */
   backend "s3" {
-     bucket       = "rag-devops-project"
+    bucket       = "rag-devops-project"
+    region       = "us-east-1"
     key          = "dev/terraform.tfstate"
     encrypt      = true
     use_lockfile = true
