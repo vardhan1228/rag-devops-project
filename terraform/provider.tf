@@ -30,7 +30,8 @@ terraform {
    * To check syntax without any backend at all: terraform init -backend=false
    */
   backend "s3" {
-    key          = "rag-devops-project/terraform.tfstate"
+     bucket       = "rag-devops-project"
+    key          = "dev/terraform.tfstate"
     encrypt      = true
     use_lockfile = true
   }
