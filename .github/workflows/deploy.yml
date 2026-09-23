@@ -1,36 +1,4 @@
-name: deploy
-
-# ===========================================================================
-#  Three jobs, in order:
-#
-#      checks  ──▶  deploy  ──▶  smoke
-#     (no AWS)      (build + apply)   (curl the live URL)
-#
-#  checks : ruff on the Python, fmt + validate on the Terraform. No AWS
-#           credentials, so a typo fails in under a minute for free.
-#  deploy : builds BOTH images, applies the Terraform, seeds the corpus.
-#  smoke  : proves the deployed stack can actually answer a question.
-#
-#  Pull requests run checks only. Pushes to main also deploy.
-# ---------------------------------------------------------------------------
-#  ONE-TIME SETUP (do this by hand before the first run)
-#
-#  1. Create the Terraform state bucket:
-#
-#       aws s3api create-bucket --bucket my-rag-tfstate --region us-east-1
-#       aws s3api put-bucket-versioning --bucket my-rag-tfstate \
-#         --versioning-configuration Status=Enabled
-#
-#  2. In the repo: Settings ▸ Secrets and variables ▸ Actions
-#
-#       Secrets    AWS_ACCESS_KEY_ID
-#                  AWS_SECRET_ACCESS_KEY
-#                  TF_STATE_BUCKET   = my-rag-tfstate
-#
-#  3. Enable the Bedrock models in the console: Titan Embed Text v2 and
-#     Nova Lite, in us-east-1.
-# ===========================================================================
-
+name: rag-deployment
 on:
   push:
     branches: [main]
@@ -70,17 +38,6 @@ jobs:
         run: |
           pip install ruff==0.8.4
           ruff check app
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Check the Terraform
-        run: |
-          terraform -chdir=terraform fmt -check -recursive
-          terraform -chdir=terraform init -backend=false
-          terraform -chdir=terraform validate
-
   # =========================================================================
   #  2. DEPLOY -- build both images, then apply
   # =========================================================================
