@@ -14,7 +14,7 @@ terraform {
   }
 
   backend "s3" {
-    bucket       = "rag-devops-project"
+    bucket       = "dev-rag-devops-project"
     region       = "us-east-1"
     key          = "dev/terraform.tfstate"
     encrypt      = true
