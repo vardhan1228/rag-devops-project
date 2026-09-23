@@ -211,3 +211,7 @@ jobs:
           WEB_URL=$(terraform -chdir=terraform output -raw web_url)
           echo "web_url=${WEB_URL}" >> "$GITHUB_OUTPUT"
           echo "$WEB_URL"
+          # Annotation + summary so the URL is visible on the run page itself,
+          # not only inside this step's collapsed log.
+          echo "::notice title=Web URL::${WEB_URL}"
+          echo "${WEB_URL}" >> "$GITHUB_STEP_SUMMARY"
