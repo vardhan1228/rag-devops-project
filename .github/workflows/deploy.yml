@@ -150,16 +150,47 @@ jobs:
           aws s3 sync sample-data/ "s3://${BUCKET}/uploads/" --size-only --delete
           echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
 
+      # The sync above fires one event-driven invocation per uploaded file,
+      # which saturates a low account concurrency limit. This call is the same
+      # function, so it gets ConcurrentInvocationLimitExceeded until those
+      # drain. Ride the throttling out rather than failing the deploy.
       - name: Rebuild the search index
-        timeout-minutes: 10
+        timeout-minutes: 20
+        env:
+          AWS_MAX_ATTEMPTS: "10"
+          AWS_RETRY_MODE: adaptive
         run: |
           set -euo pipefail
-          aws lambda invoke \
-            --function-name "$(terraform -chdir=terraform output -raw ingest_lambda_name)" \
-            --cli-binary-format raw-in-base64-out \
-            --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
-            --cli-read-timeout 600 \
-            result.json >/dev/null
+          FUNCTION=$(terraform -chdir=terraform output -raw ingest_lambda_name)
+          ATTEMPTS=8
+
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if aws lambda invoke \
+                 --function-name "$FUNCTION" \
+                 --cli-binary-format raw-in-base64-out \
+                 --payload "{\"reindex\":true,\"bucket\":\"${BUCKET}\",\"prefix\":\"uploads/\"}" \
+                 --cli-read-timeout 600 \
+                 result.json >/dev/null 2>invoke.err; then
+              break
+            fi
+
+            # Anything other than throttling is a real failure, so stop now.
+            if ! grep -qE 'TooManyRequestsException|ConcurrentInvocationLimitExceeded' invoke.err; then
+              cat invoke.err
+              echo "::error::lambda invoke failed"
+              exit 1
+            fi
+
+            if [ "$attempt" -eq "$ATTEMPTS" ]; then
+              cat invoke.err
+              echo "::error::Still throttled after ${ATTEMPTS} attempts. Check the account's Lambda concurrent execution limit."
+              exit 1
+            fi
+
+            echo "attempt ${attempt}: throttled, waiting for concurrency to free up"
+            sleep 30
+          done
+
           cat result.json | jq .
 
           # A Lambda error comes back as an errorMessage key, not a bad exit code.
