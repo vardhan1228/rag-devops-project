@@ -8,14 +8,16 @@
  * app/retrieval/ has no Dockerfile and no registry, because retrieval has no
  * entrypoint: it is a library the API imports and runs in-process.
  *
- * Both images are pushed with the same tag: the git commit SHA. Tags are
- * IMMUTABLE, so a tag always means exactly one build and a rollback is simply
- * redeploying an older tag.
+ * Both images are pushed with the same tag: the git commit SHA. In prod tags
+ * are IMMUTABLE, so a tag always means exactly one build and a rollback is
+ * simply redeploying an older tag. Outside prod they are MUTABLE, because
+ * re-running a deploy on an unchanged commit has to be able to push the same
+ * tag again instead of failing the build.
  */
 
 resource "aws_ecr_repository" "api" {
   name                 = "${local.name}-api"
-  image_tag_mutability = "IMMUTABLE"
+  image_tag_mutability = var.environment == "prod" ? "IMMUTABLE" : "MUTABLE"
   force_delete         = var.environment != "prod"
 
   image_scanning_configuration {
@@ -29,7 +31,7 @@ resource "aws_ecr_repository" "api" {
 
 resource "aws_ecr_repository" "ingest" {
   name                 = "${local.name}-ingest"
-  image_tag_mutability = "IMMUTABLE"
+  image_tag_mutability = var.environment == "prod" ? "IMMUTABLE" : "MUTABLE"
   force_delete         = var.environment != "prod"
 
   image_scanning_configuration {
