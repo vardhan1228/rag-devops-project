@@ -1,5 +1,5 @@
 # Amazon Bedrock + OpenSearch RAG
-- aws s3api create-bucket --bucket rag-devops-project --region us-east-1
+- aws s3api create-bucket --bucket dev-rag-devops-project --region us-east-1
 ## 📌 Overview
 
 This project demonstrates a simple **Retrieval-Augmented Generation (RAG)** architecture using:
