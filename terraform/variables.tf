@@ -120,15 +120,9 @@ variable "chat_model_id" {
 
 # ---------------------------------------------------------------- containers
 variable "image_tag" {
-  description = "Tag of the image in the stack's ECR repository."
+  description = "Tag pushed to both ECR repositories. CI sets this to the commit SHA."
   type        = string
   default     = "v2"
-}
-
-variable "container_image" {
-  description = "Override the full image URI. Leave empty to use the ECR repo created here."
-  type        = string
-  default     = ""
 }
 
 variable "api_port" {
@@ -159,17 +153,4 @@ variable "log_retention_days" {
   description = "CloudWatch log retention."
   type        = number
   default     = 7
-}
-
-# ---------------------------------------------------------------- build host
-variable "builder_instance_type" {
-  description = "EC2 instance type for the Docker build host."
-  type        = string
-  default     = "t3.small"
-}
-
-variable "builder_enabled" {
-  description = "Create the Docker build host. Set to false to stop paying for it once the image is pushed."
-  type        = bool
-  default     = true
 }

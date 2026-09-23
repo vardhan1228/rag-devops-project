@@ -33,7 +33,8 @@ flowchart TB
     direction TB
     sm["Secrets Manager<br/>API key"]
     dlq["SQS dead letter queue"]
-    ecr[("ECR<br/>one image, two entrypoints")]
+    ecrapi[("ECR · api image<br/>app/api/Dockerfile<br/>contains app/retrieval too")]
+    ecring[("ECR · ingest image<br/>app/ingestion/Dockerfile")]
     logs["CloudWatch Logs"]
   end
 
@@ -51,8 +52,8 @@ flowchart TB
   lam -->|"bulk index passages"| os
   lam -.->|"after 1 failed retry"| dlq
 
-  ecr -.->|"uvicorn entrypoint"| api
-  ecr -.->|"awslambdaric entrypoint"| lam
+  ecrapi -.->|"uvicorn on :8000"| api
+  ecring -.->|"lambda_handler"| lam
   sm -.->|"injected as API_KEY<br/>by execution role at startup"| api
   api -.-> logs
   lam -.-> logs
@@ -67,6 +68,6 @@ flowchart TB
 
   class alb,user edge
   class api,lam compute
-  class os,s3,ecr,sm,dlq,logs store
+  class os,s3,ecrapi,ecring,sm,dlq,logs store
   class emb,gen model
   class cred note

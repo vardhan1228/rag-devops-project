@@ -1,33 +1,7 @@
-resource "aws_ecr_repository" "api" {
-  name                 = local.name
-  image_tag_mutability = "IMMUTABLE"
-  force_delete         = var.environment != "prod"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
-}
-
-resource "aws_ecr_lifecycle_policy" "api" {
-  repository = aws_ecr_repository.api.name
-
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep the 15 most recent images"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = 15
-      }
-      action = { type = "expire" }
-    }]
-  })
-}
+/**
+ * The query API: ECS Fargate service behind the load balancer.
+ * Its image is built from app/api/Dockerfile. The registries live in ecr.tf.
+ */
 
 resource "aws_security_group" "api" {
   name        = "${local.name}-api"
@@ -95,7 +69,7 @@ resource "aws_ecs_task_definition" "api" {
 
   container_definitions = jsonencode([{
     name      = "api"
-    image     = local.image
+    image     = local.api_image
     essential = true
 
     portMappings = [{

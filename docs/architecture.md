@@ -56,12 +56,41 @@ The two paths hold separate IAM roles. The API may read the index and call the
 models; the Lambda may read documents and write the index. Neither carries the
 other's permissions.
 
-One image serves both, with different entrypoints: `uvicorn` under ECS,
-`awslambdaric` under Lambda. The application code is therefore identical in both
-places, which removes a whole class of "works in the API, fails in ingestion"
-bug.
+Each path has its own image, and each Dockerfile sits in the directory whose
+code it builds. Open a service's folder and its build recipe is right there
+next to its entrypoint:
 
-No AWS credentials exist in the image or the code. Every AWS call is SigV4
+```
+app/api/            main.py       + Dockerfile   ->  ECS Fargate
+app/ingestion/      indexer.py    + Dockerfile   ->  Lambda
+app/retrieval/      rag.py, search.py            ->  no Dockerfile
+```
+
+| Dockerfile | Base image | Runs on | Starts |
+| --- | --- | --- | --- |
+| `app/api/Dockerfile` | `python:3.12-slim` | ECS Fargate | `uvicorn` on port 8000 |
+| `app/ingestion/Dockerfile` | `public.ecr.aws/lambda/python:3.12` | Lambda | `lambda_handler` |
+
+Two images, not three, even though `app/` has three packages. `app/retrieval/`
+gets no Dockerfile because retrieval has no entrypoint: `main.py` imports
+`answer_question` and `hybrid_search` and calls them in-process, so retrieval
+ships *inside* the API image. The rule is one Dockerfile per process that
+starts, not one per folder.
+
+Both are built with the repo root as the Docker context, since each image needs
+`app/` and `requirements.txt`:
+
+```bash
+docker build -f app/api/Dockerfile       -t rag-api    .
+docker build -f app/ingestion/Dockerfile -t rag-ingest .
+```
+
+So the chunking and embedding code is literally the same code in both places.
+What differs is only how the process is started, and that difference now lives
+in the Dockerfile beside the code, rather than in an entrypoint override buried
+in the Lambda resource.
+
+No AWS credentials exist in either image or in the code. Every AWS call is SigV4
 signed from the task role. That is what "Bedrock connects automatically" means,
 and it is a different question from whether a browser needs a key to call your
 API.
@@ -122,39 +151,33 @@ overwrites the same index documents instead of duplicating them.
 
 ![Deployment pipeline](diagrams/05-deployment-pipeline.png)
 
-Six jobs, cheapest checks first. Lint and validate need no AWS access at all,
-so a typo fails in under a minute without touching the account.
+Three jobs, cheapest first.
 
-`bootstrap` then proves the credentials work and creates the hardened state
-bucket, and publishes the two settings the later jobs need: the bucket name and
-whether to seed the corpus. Deciding both in one place is what keeps the rest of
-the file short, since no other job has to derive them.
+`checks` needs no AWS access at all: `ruff` on the Python, `terraform fmt` and
+`terraform validate` with `-backend=false`. A typo fails in under a minute
+without touching the account. Pull requests stop here.
 
-`deploy` is a single job that applies in three phases, for a specific reason:
-Terraform creates the ECR repository, but the ECS service and the Lambda both
-reference an image tag inside it, and a single apply fails on first run because
-the tag does not exist yet. So it applies only the repository, pushes an image
-tagged with the commit SHA, then applies everything else pointing at that tag.
-That is step ordering rather than a reason for separate jobs, so it authenticates
-and runs `terraform init` once, and the environment approval gate covers the
-whole deployment instead of only its last phase.
+`deploy` is one job with four steps, in this order for a specific reason.
+Terraform creates the two ECR repositories, but the ECS service and the Lambda
+each reference an image tag inside one of them, and a single apply fails on a
+fresh account because the tags do not exist yet. So it applies only the
+repositories, pushes both images tagged with the commit SHA, applies everything
+else, then seeds the corpus. That is step ordering, not a reason for separate
+jobs, so it authenticates and runs `terraform init` once.
 
 Because tags are immutable and equal to the commit SHA, the running code is
-never ambiguous, and rollback is redeploying a known tag.
+never ambiguous, and a rollback is redeploying an older tag.
 
-Seeding the corpus is optional. Set the `SEED_CORPUS` repository variable to
-`false`, or untick "Seed the corpus" on a manual run, when you manage the
-documents in the bucket yourself: the sync and reindex steps are skipped and
-whatever is already indexed is left untouched. Nothing in the running service
-depends on them, so the deployment is unaffected either way.
+The state bucket is not created by the pipeline. You create it once by hand and
+set the `TF_STATE_BUCKET` repository variable; the deploy job fails with a clear
+message if it is missing. Bootstrapping the thing that holds your state is a
+one-time act, and having a pipeline do it hides where state lives.
 
-The last job earns its place. It asserts the load balancer returns 200 and the
-UI is actually being served. When this run seeded the corpus, it additionally
-requires a populated index and a real question coming back with citations, which
-covers the whole path end to end: S3 event, Lambda, embeddings, OpenSearch k-NN,
-and generation. A deployment that starts cleanly but cannot answer anything fails
-the build. With seeding turned off there is nothing to promise about the index,
-so an empty one is reported as a notice and the retrieval check is skipped.
+The last job earns its place. It asserts `/health` returns 200, `/ready` reports
+the index exists, and a real question comes back with citations. That covers the
+whole path end to end: S3 event, Lambda, embeddings, OpenSearch k-NN, and
+generation. A deployment that starts cleanly but cannot answer anything fails
+the build.
 
 ---
 

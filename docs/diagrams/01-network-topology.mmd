@@ -41,7 +41,7 @@ flowchart LR
   lam -.-> s3ep
   s3ep --> s3
 
-  sg["Security group rules, all reference groups not CIDRs<br/><br/>alb-sg    inbound  80 from allowed_web_cidrs<br/>alb-sg    outbound 8000 to api-sg only<br/>api-sg    inbound  8000 from alb-sg and VPC CIDR<br/>search-sg inbound  443 from api-sg and lambda-sg<br/>builder-sg inbound none, managed over SSM"]
+  sg["Security group rules, all reference groups not CIDRs<br/><br/>alb-sg    inbound  80 from allowed_web_cidrs<br/>alb-sg    outbound 8000 to api-sg only<br/>api-sg    inbound  8000 from alb-sg and VPC CIDR<br/>search-sg inbound  443 from api-sg and lambda-sg"]
 
   classDef edge fill:#f3e8ff,stroke:#9a4cff,color:#26113a
   classDef compute fill:#e8f0fe,stroke:#4c8dff,color:#11203a

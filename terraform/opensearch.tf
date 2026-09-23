@@ -36,25 +36,6 @@ resource "aws_vpc_security_group_egress_rule" "opensearch_all" {
   cidr_ipv4         = "0.0.0.0/0"
 }
 
-resource "aws_cloudwatch_log_group" "opensearch" {
-  name              = "/aws/opensearch/${local.name}"
-  retention_in_days = var.log_retention_days
-}
-
-resource "aws_cloudwatch_log_resource_policy" "opensearch" {
-  policy_name = "${local.name}-opensearch-logs"
-
-  policy_document = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "es.amazonaws.com" }
-      Action    = ["logs:PutLogEvents", "logs:CreateLogStream"]
-      Resource  = "${aws_cloudwatch_log_group.opensearch.arn}:*"
-    }]
-  })
-}
-
 resource "aws_opensearch_domain" "vectors" {
   domain_name    = local.name
   engine_version = "OpenSearch_2.17"
@@ -117,11 +98,6 @@ resource "aws_opensearch_domain" "vectors" {
     internal_user_database_enabled = false
   }
 
-  log_publishing_options {
-    log_type                 = "INDEX_SLOW_LOGS"
-    cloudwatch_log_group_arn = aws_cloudwatch_log_group.opensearch.arn
-  }
-
   # IAM-only access: signed SigV4 requests from the two task roles.
   access_policies = jsonencode({
     Version = "2012-10-17"
@@ -135,8 +111,5 @@ resource "aws_opensearch_domain" "vectors" {
     }]
   })
 
-  depends_on = [
-    aws_cloudwatch_log_resource_policy.opensearch,
-    aws_iam_service_linked_role.opensearch,
-  ]
+  depends_on = [aws_iam_service_linked_role.opensearch]
 }

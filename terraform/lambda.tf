@@ -28,21 +28,17 @@ resource "aws_cloudwatch_log_group" "ingest" {
   retention_in_days = var.log_retention_days
 }
 
-# Container-image Lambda so ingestion runs the exact same code as the API.
+# Built from app/ingestion/Dockerfile, which starts FROM the AWS Lambda base
+# image.
+# That image already knows how to start the handler, so there is no entrypoint
+# override here: the Dockerfile's CMD names the function.
 resource "aws_lambda_function" "ingest" {
   function_name = "${local.name}-ingest"
   role          = aws_iam_role.lambda_ingest.arn
   package_type  = "Image"
-  image_uri     = local.image
+  image_uri     = local.ingest_image
   timeout       = 300
   memory_size   = 1024
-
-  # The image's default CMD starts uvicorn for ECS; Lambda overrides the
-  # entrypoint with the runtime interface client so one image serves both.
-  image_config {
-    entry_point = ["/usr/local/bin/python", "-m", "awslambdaric"]
-    command     = ["app.ingestion.indexer.lambda_handler"]
-  }
 
   vpc_config {
     subnet_ids         = aws_subnet.private[*].id

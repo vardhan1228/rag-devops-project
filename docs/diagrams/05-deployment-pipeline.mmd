@@ -1,57 +1,53 @@
-%% CI/CD pipeline. The apply is split because Terraform owns the registry,
-%% but ECS and Lambda cannot start until an image exists inside it.
+%% CI/CD pipeline. The apply is split because Terraform owns the registries,
+%% but ECS and Lambda cannot start until an image exists inside them.
 flowchart TB
   dev["git push to main"]
-  prq["Pull request<br/>plan only, never applies"]
+  prq["Pull request<br/>checks only, never deploys"]
+  manual["State bucket<br/>created once by hand"]
 
   subgraph gha["GitHub Actions · deploy workflow"]
     direction TB
 
-    subgraph q["no AWS access, fails fast"]
-      direction LR
-      test["lint<br/>ruff<br/>Python 3.12"]
-      val["validate<br/>terraform fmt -check<br/>terraform validate<br/>with -backend=false"]
-    end
+    checks["1 · checks<br/>no AWS access, fails fast<br/>ruff check app<br/>terraform fmt -check<br/>terraform validate -backend=false"]
 
-    boot["bootstrap<br/>sts get-caller-identity<br/>assert it matches AWS_ACCOUNT_ID<br/>create state bucket if absent<br/>versioning · SSE · TLS-only policy<br/>publish bucket name + seed decision"]
-
-    subgraph d["deploy · one job, four phases"]
+    subgraph d["2 · deploy · one job, four steps"]
       direction TB
-      reg["1 · registry<br/>terraform apply<br/>-target aws_ecr_repository.api<br/>nothing else yet"]
-      build["2 · image<br/>docker buildx build and push<br/>tag is the commit SHA<br/>provenance false, Lambda needs it"]
-      app["3 · workloads<br/>terraform apply, full<br/>TF_VAR_image_tag=SHA<br/>then wait services-stable"]
-      data["4 · corpus · optional<br/>skipped when SEED_CORPUS=false<br/>aws s3 sync --delete<br/>invoke Lambda reindex<br/>fail if 0 indexed or any failed"]
+      reg["a · registries<br/>terraform apply -target<br/>aws_ecr_repository.api<br/>aws_ecr_repository.ingest"]
+      build["b · two images<br/>app/api/Dockerfile       -> api repo<br/>app/ingestion/Dockerfile -> ingest repo<br/>context is the repo root<br/>both tagged with the commit SHA"]
+      app["c · workloads<br/>terraform apply, full<br/>TF_VAR_image_tag=SHA<br/>then wait services-stable"]
+      data["d · corpus<br/>aws s3 sync --delete<br/>invoke Lambda reindex<br/>fail if 0 passages indexed"]
       reg --> build --> app --> data
     end
 
-    smoke["smoke<br/>/health returns 200<br/>UI contains RAG Console<br/>/ready shows index_exists<br/>real question returns citations<br/>last two only when phase 4 ran"]
+    smoke["3 · smoke<br/>/health returns 200<br/>/ready shows index_exists<br/>a real question returns citations"]
 
-    test --> boot
-    val --> boot
-    boot --> reg
+    checks --> reg
     data --> smoke
   end
 
   subgraph awsres["AWS"]
     direction LR
-    tfstate[("S3 dev-genai-cloudrag<br/>terraform.tfstate<br/>S3 native locking")]
-    ecr[("ECR<br/>immutable tag = SHA")]
+    tfstate[("S3 state bucket<br/>terraform.tfstate<br/>S3 native locking")]
+    ecrapi[("ECR · api<br/>immutable tag = SHA")]
+    ecring[("ECR · ingest<br/>immutable tag = SHA")]
     stack["VPC · ALB · ECS · Lambda<br/>OpenSearch · S3 · IAM<br/>Secrets · SQS · autoscaling"]
     corpus[("S3 uploads/<br/>10 documents")]
   end
 
-  dev --> test
-  dev --> val
-  prq -.-> boot
+  dev --> checks
+  prq -.-> checks
+  manual -.->|"you create this"| tfstate
 
-  boot -.->|"create if absent"| tfstate
   app -.->|"read and write state"| tfstate
-  build -.->|"push image"| ecr
+  build -.->|"push"| ecrapi
+  build -.->|"push"| ecring
+  ecrapi -.->|"ECS pulls"| stack
+  ecring -.->|"Lambda pulls"| stack
   app -.->|"create or update"| stack
   data -.-> corpus
   smoke -.->|"HTTP through the ALB"| stack
 
-  gate["Why the split<br/><br/>Terraform creates the ECR repository, but the ECS<br/>service and the Lambda both reference an image tag<br/>inside it. A single apply would fail on first run,<br/>because the tag does not exist yet."]
+  gate["Why the split<br/><br/>Terraform creates the ECR repositories, but the ECS<br/>service and the Lambda both reference an image tag<br/>inside them. A single apply would fail on first run,<br/>because the tags do not exist yet."]
 
   classDef job fill:#e8f0fe,stroke:#4c8dff,color:#11203a
   classDef gateclass fill:#eaf7ee,stroke:#48a868,color:#11301c
@@ -59,8 +55,8 @@ flowchart TB
   classDef trigger fill:#f3e8ff,stroke:#9a4cff,color:#26113a
   classDef note fill:#fffbe6,stroke:#d4b106,color:#3a3111
 
-  class test,val,reg,build,app,data job
-  class boot,smoke gateclass
-  class tfstate,ecr,stack,corpus store
-  class dev,prq trigger
+  class reg,build,app,data job
+  class checks,smoke gateclass
+  class tfstate,ecrapi,ecring,stack,corpus store
+  class dev,prq,manual trigger
   class gate note
